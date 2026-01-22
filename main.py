@@ -141,7 +141,7 @@ def gen_uvsphere(slices=12, stacks=8, radius=1.0):
         phi = v * math.pi
         for j in range(slices + 1):
             u = j / float(slices)
-            theta = u * math.tau
+            theta = u * (2.0 * math.pi)
             x = math.sin(phi) * math.cos(theta)
             y = math.cos(phi)
             z = math.sin(phi) * math.sin(theta)
