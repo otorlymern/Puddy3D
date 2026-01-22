@@ -10,6 +10,7 @@ from mido import get_input_names, open_input
 
 PRINT_MIDI = False
 NUM_OBJECTS = 4
+TAU = 2.0 * math.pi
 
 # MIDI mapping - ground-truth NanoKontrol2 CCs
 MIDI_MAP = {
@@ -55,9 +56,9 @@ class LFO:
     def tick(self, t, dt):
         if not self.enabled or self.amp == 0.0:
             return 0.0
-        self.phase += dt * self.freq_hz * math.tau
-        if self.phase > math.tau:
-            self.phase -= math.tau
+        self.phase += dt * self.freq_hz * TAU
+        if self.phase > TAU:
+            self.phase -= TAU
         return self.amp * math.sin(self.phase)
 
 
@@ -202,8 +203,8 @@ def gen_cone(sides=8, radius=0.6, height=1.2):
     center = np.array([0.0, base_y, 0.0], dtype=np.float32)
 
     for i in range(sides):
-        a0 = (i / float(sides)) * math.tau
-        a1 = ((i + 1) / float(sides)) * math.tau
+        a0 = (i / float(sides)) * TAU
+        a1 = ((i + 1) / float(sides)) * TAU
         b0 = np.array([math.cos(a0) * radius, base_y, math.sin(a0) * radius], dtype=np.float32)
         b1 = np.array([math.cos(a1) * radius, base_y, math.sin(a1) * radius], dtype=np.float32)
 
@@ -236,8 +237,8 @@ def gen_cylinder(sides=10, radius=0.6, height=1.2):
     bot_center = np.array([0.0, bot_y, 0.0], dtype=np.float32)
 
     for i in range(sides):
-        a0 = (i / float(sides)) * math.tau
-        a1 = ((i + 1) / float(sides)) * math.tau
+        a0 = (i / float(sides)) * TAU
+        a1 = ((i + 1) / float(sides)) * TAU
         p0 = np.array([math.cos(a0) * radius, bot_y, math.sin(a0) * radius], dtype=np.float32)
         p1 = np.array([math.cos(a1) * radius, bot_y, math.sin(a1) * radius], dtype=np.float32)
         p2 = np.array([math.cos(a1) * radius, top_y, math.sin(a1) * radius], dtype=np.float32)
@@ -267,10 +268,113 @@ def gen_cylinder(sides=10, radius=0.6, height=1.2):
     return np.array(verts, "f"), np.array(norms, "f"), np.array(uvs, "f"), np.array(inds, "i4")
 
 
+def _compute_normals(verts, inds):
+    norms = np.zeros_like(verts, dtype=np.float32)
+    if inds.size == 0:
+        norms[:, 2] = 1.0
+        return norms
+    v0 = verts[inds[:, 0]]
+    v1 = verts[inds[:, 1]]
+    v2 = verts[inds[:, 2]]
+    face_norms = np.cross(v1 - v0, v2 - v0)
+    np.add.at(norms, inds[:, 0], face_norms)
+    np.add.at(norms, inds[:, 1], face_norms)
+    np.add.at(norms, inds[:, 2], face_norms)
+    lens = np.linalg.norm(norms, axis=1)
+    good = lens > 1e-6
+    norms[good] /= lens[good][:, None]
+    norms[~good, 2] = 1.0
+    return norms
+
+
+def _coerce_mesh_arrays(verts, norms, uvs, inds):
+    v = np.asarray(verts, dtype=np.float32)
+    assert v.ndim == 2 and v.shape[1] == 3, "verts must be (N,3)"
+
+    ind = np.asarray(inds)
+    assert ind.size > 0, "indices must be non-empty"
+    if ind.ndim == 1:
+        assert ind.size % 3 == 0, "indices length must be multiple of 3"
+        ind = ind.reshape((-1, 3))
+    assert ind.ndim == 2 and ind.shape[1] == 3, "indices must be (M,3)"
+    assert ind.min() >= 0, "indices must be non-negative"
+    ind_max = int(ind.max())
+    ind_dtype = np.uint16 if ind_max < 65536 else np.uint32
+    ind = ind.astype(ind_dtype, copy=False)
+
+    if norms is None or (hasattr(norms, "__len__") and len(norms) == 0):
+        n = _compute_normals(v, ind)
+    else:
+        n = np.asarray(norms, dtype=np.float32)
+        assert n.ndim == 2 and n.shape[1] == 3, "normals must be (N,3)"
+        assert n.shape[0] == v.shape[0], "normals must match verts"
+
+    if uvs is None or (hasattr(uvs, "__len__") and len(uvs) == 0):
+        uv = np.zeros((v.shape[0], 2), dtype=np.float32)
+    else:
+        uv = np.asarray(uvs, dtype=np.float32)
+        assert uv.ndim == 2 and uv.shape[1] == 2, "uvs must be (N,2)"
+        assert uv.shape[0] == v.shape[0], "uvs must match verts"
+
+    return v, n, uv, ind
+
+
+def _load_shader(name, fallback="uv_flat"):
+    try:
+        return pi3d.Shader(name)
+    except Exception as exc:
+        print("Shader '{}' unavailable ({}); falling back to '{}'".format(name, exc, fallback))
+        return pi3d.Shader(fallback)
+
+
 class DeformShape(pi3d.Shape):
-    def __init__(self, verts, norms, uvs, inds, shader, color):
-        super().__init__()
-        self.buf = [pi3d.Buffer(self, verts, uvs, inds, norms)]
+    def __init__(
+        self,
+        verts,
+        norms,
+        uvs,
+        inds,
+        shader,
+        color,
+        camera=None,
+        light=None,
+        name="deform",
+        x=0.0,
+        y=0.0,
+        z=0.0,
+        rx=0.0,
+        ry=0.0,
+        rz=0.0,
+        sx=1.0,
+        sy=1.0,
+        sz=1.0,
+        cx=0.0,
+        cy=0.0,
+        cz=0.0,
+    ):
+        super().__init__(
+            camera=camera,
+            light=light,
+            name=name,
+            x=x,
+            y=y,
+            z=z,
+            rx=rx,
+            ry=ry,
+            rz=rz,
+            sx=sx,
+            sy=sy,
+            sz=sz,
+            cx=cx,
+            cy=cy,
+            cz=cz,
+        )
+        v, n, uv, ind = _coerce_mesh_arrays(verts, norms, uvs, inds)
+        self._verts = v
+        self._norms = n
+        self._uvs = uv
+        self._inds = ind
+        self.buf = [pi3d.Buffer(self, v, uv, ind, n)]
         self.set_draw_details(shader, [], 1.0, 1.0, 1.0, 1.0)
         self.set_material(color)
 
@@ -308,7 +412,7 @@ class SynthObject:
         self.zone_dirs = self._compute_zone_dirs()
 
         rng = np.random.RandomState(seed)
-        self.boil_seeds = rng.uniform(0.0, math.tau, size=self.base_verts.shape).astype(np.float32)
+        self.boil_seeds = rng.uniform(0.0, TAU, size=self.base_verts.shape).astype(np.float32)
         self.boil_scale = 0.08
 
         self.move_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -461,7 +565,7 @@ def object_button_states(midi_state, obj_idx):
     return s_active, m_active, r_active
 
 
-def make_shape(kind, shader, color):
+def make_shape(kind, shader, color, camera=None, light=None):
     if kind == 1:
         v, n, uv, ind = gen_uvsphere(12, 8, 1.0)
     elif kind == 2:
@@ -471,8 +575,8 @@ def make_shape(kind, shader, color):
     else:
         v, n, uv, ind = gen_cylinder(10, 0.6, 1.2)
 
-    shape = DeformShape(v, n, uv, ind, shader, color)
-    return shape, v, n
+    shape = DeformShape(v, n, uv, ind, shader, color, camera=camera, light=light)
+    return shape, shape._verts, shape._norms
 
 
 def resolve_intent(midi_state):
@@ -524,10 +628,13 @@ def make_debug_overlay(display):
 def main():
     display = pi3d.Display.create(x=0, y=0, w=1280, h=720, frames_per_second=60)
     display.set_background(0.02, 0.02, 0.02, 1.0)
-    shader = pi3d.Shader("mat_flat")
-
     camera = pi3d.Camera(is_3d=True)
-    pi3d.Light(lightpos=(3, 4, 6), lightcol=(0.9, 0.9, 0.9), lightamb=(0.2, 0.2, 0.2))
+    light = pi3d.Light(
+        lightpos=(3, 4, 6),
+        lightcol=(0.9, 0.9, 0.9),
+        lightamb=(0.2, 0.2, 0.2),
+    )
+    shader = _load_shader("mat_flat")
 
     colors = [
         (0.9, 0.6, 0.2, 1.0),
@@ -545,7 +652,7 @@ def main():
 
     objects = []
     for i in range(NUM_OBJECTS):
-        shape, v, n = make_shape(shapes[i], shader, colors[i])
+        shape, v, n = make_shape(shapes[i], shader, colors[i], camera=camera, light=light)
         obj = SynthObject(
             shape,
             v,
