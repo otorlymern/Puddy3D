@@ -906,7 +906,7 @@ def run_desktop_preview():
     sculpt_target_index = None
     active_toggles = [False] * NUM_OBJECTS
     sculpt_rearm = False
-    sculpt_rearm = False
+
 
     @window.event
     def on_close():
@@ -931,6 +931,54 @@ def run_desktop_preview():
         gl.glMatrixMode(gl.GL_MODELVIEW)
         gl.glLoadIdentity()
         return pyglet.event.EVENT_HANDLED
+
+    def preview_update(_dt):
+        nonlocal last_time, fps_smooth, active_state, sculpt_mode, sculpt_target_index, active_toggles, sculpt_rearm
+        now = time.time()
+        dt = now - last_time
+        last_time = now
+        t = now - start_time
+        if dt <= 0.0:
+            dt = 1.0 / 60.0
+
+        midi_state.capture_prev()
+        if port:
+            for msg in port.iter_pending():
+                if PRINT_MIDI:
+                    print(msg)
+                midi_state.update_from_msg(msg)
+
+        if button_rising(midi_state.rec_transport, midi_state.rec_transport_prev):
+            apply_reset(objects, midi_state)
+            sculpt_mode = False
+            sculpt_target_index = None
+            sculpt_rearm = False
+
+        active_toggles = update_active_toggles(midi_state, active_toggles)
+        sculpt_mode, sculpt_target_index, sculpt_rearm = update_sculpt_state(
+            midi_state, sculpt_mode, sculpt_target_index, sculpt_rearm
+        )
+        active_state, modes = apply_controls(
+            objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
+        )
+
+        for obj in objects:
+            obj.update(t, dt)
+
+        inst_fps = 1.0 / dt if dt > 0.0 else 0.0
+        fps_smooth = fps_smooth * 0.9 + inst_fps * 0.1
+        active_list = [str(i + 1) for i, a in enumerate(active_state) if a]
+        active_text = ",".join(active_list) if active_list else "none"
+        sculpt_label = "none"
+        if sculpt_mode and sculpt_target_index is not None:
+            sculpt_label = "ON {}".format(sculpt_target_index + 1)
+        elif sculpt_mode:
+            sculpt_label = "ON"
+        lfo_summary = lfo_state_summary(midi_state)
+        label.text = "FPS: {:.1f}\nActive: {}\nSculpt: {}\nLFO: {}".format(
+            fps_smooth, active_text, sculpt_label, lfo_summary
+        )
+        label.y = window.height - 10
 
     @window.event
     def on_draw():
@@ -965,55 +1013,7 @@ def run_desktop_preview():
 
         label.draw()
 
-    def update(_dt):
-    nonlocal last_time, fps_smooth, active_state, sculpt_mode, sculpt_target_index, active_toggles, sculpt_rearm
-        now = time.time()
-        dt = now - last_time
-        last_time = now
-        t = now - start_time
-        if dt <= 0.0:
-            dt = 1.0 / 60.0
-
-        midi_state.capture_prev()
-        if port:
-            for msg in port.iter_pending():
-                if PRINT_MIDI:
-                    print(msg)
-                midi_state.update_from_msg(msg)
-
-        if button_rising(midi_state.rec_transport, midi_state.rec_transport_prev):
-            apply_reset(objects, midi_state)
-            sculpt_mode = False
-            sculpt_target_index = 0
-            sculpt_rearm = midi_state.cycle
-
-        active_toggles = update_active_toggles(midi_state, active_toggles)
-        sculpt_mode, sculpt_target_index, sculpt_rearm = update_sculpt_state(
-            midi_state, sculpt_mode, sculpt_target_index, sculpt_rearm
-        )
-        active_state, modes = apply_controls(
-            objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
-        )
-
-        for obj in objects:
-            obj.update(t, dt)
-
-        inst_fps = 1.0 / dt if dt > 0.0 else 0.0
-        fps_smooth = fps_smooth * 0.9 + inst_fps * 0.1
-        active_list = [str(i + 1) for i, a in enumerate(active_state) if a]
-        active_text = ",".join(active_list) if active_list else "none"
-        sculpt_label = "none"
-        if sculpt_mode and sculpt_target_index is not None:
-            sculpt_label = "ON {}".format(sculpt_target_index + 1)
-        elif sculpt_mode:
-            sculpt_label = "ON"
-        lfo_summary = lfo_state_summary(midi_state)
-        label.text = "FPS: {:.1f}\nActive: {}\nSculpt: {}\nLFO: {}".format(
-            fps_smooth, active_text, sculpt_label, lfo_summary
-        )
-        label.y = window.height - 10
-
-    pyglet.clock.schedule_interval(update, 1.0 / 60.0)
+    pyglet.clock.schedule_interval(preview_update, 1.0 / 60.0)
     pyglet.app.run()
 
 
@@ -1055,6 +1055,7 @@ def run_headless_mac():
     sculpt_mode = False
     sculpt_target_index = None
     active_toggles = [False] * NUM_OBJECTS
+    sculpt_rearm = False
 
     start_time = time.time()
     last_time = start_time
@@ -1082,8 +1083,8 @@ def run_headless_mac():
             if button_rising(midi_state.rec_transport, midi_state.rec_transport_prev):
                 apply_reset(objects, midi_state)
                 sculpt_mode = False
-                sculpt_target_index = 0
-                sculpt_rearm = midi_state.cycle
+                sculpt_target_index = None
+                sculpt_rearm = False
 
             active_toggles = update_active_toggles(midi_state, active_toggles)
             sculpt_mode, sculpt_target_index, sculpt_rearm = update_sculpt_state(
@@ -1313,8 +1314,8 @@ def run_pi3d():
         if button_rising(midi_state.rec_transport, midi_state.rec_transport_prev):
             apply_reset(objects, midi_state)
             sculpt_mode = False
-            sculpt_target_index = 0
-            sculpt_rearm = midi_state.cycle
+            sculpt_target_index = None
+            sculpt_rearm = False
 
         active_toggles = update_active_toggles(midi_state, active_toggles)
         sculpt_mode, sculpt_target_index, sculpt_rearm = update_sculpt_state(
