@@ -438,8 +438,10 @@ def _coerce_mesh_arrays(verts, norms, uvs, inds):
 
 
 class SynthObject:
-    def __init__(self, shape, base_verts, base_norms, base_pos, color, seed):
+    def __init__(self, shape, base_verts, base_norms, base_pos, color, seed, wire_shape=None, wire_line_inds=None):
         self.shape = shape
+        self.wire_shape = wire_shape
+        self.wire_line_inds = wire_line_inds
         self.active = True
         self.pos = np.array(base_pos, dtype=np.float32)
         self.base_pos = np.array(base_pos, dtype=np.float32)
@@ -626,6 +628,9 @@ class SynthObject:
 
         if self.shape is not None:
             self.shape.buf[0].re_init(pts=v)
+        if self.wire_shape is not None and self.wire_line_inds is not None:
+            wire_pts = v[self.wire_line_inds]
+            self.wire_shape.buf[0].re_init(pts=wire_pts)
 
         lfo_scale = self.lfo_scale.tick(t, dt)
         lfo_move = self.lfo_move.tick(t, dt)
@@ -654,10 +659,20 @@ class SynthObject:
             self.shape.rotateToY(rot_y)
             self.shape.rotateToZ(rot_z)
             self.shape.scale(scale, scale, scale)
+        if self.wire_shape is not None:
+            self.wire_shape.position(pos_x, pos_y, pos_z)
+            self.wire_shape.rotateToX(rot_x)
+            self.wire_shape.rotateToY(rot_y)
+            self.wire_shape.rotateToZ(rot_z)
+            self.wire_shape.scale(scale, scale, scale)
 
     def draw(self):
-        if self.active and self.shape is not None:
+        if not self.active:
+            return
+        if self.shape is not None:
             self.shape.draw()
+        if self.wire_shape is not None:
+            self.wire_shape.draw()
 
 
 def object_channel_indices(obj_idx):
@@ -849,6 +864,11 @@ def run_desktop_preview():
     gl.glEnable(gl.GL_DEPTH_TEST)
     gl.glPointSize(2.0)
 
+    # Fog parameters for subtle retro depth shading
+    FOG_NEAR = 2.0
+    FOG_FAR = 6.0
+    FOG_COLOR = (0.02, 0.02, 0.02)
+
     names = list_midi_inputs()
     port = open_nanoport(names=names, quiet_no_input=True)
     midi_state = MidiState()
@@ -868,6 +888,7 @@ def run_desktop_preview():
     shapes = [1, 2, 3, 4]
 
     objects = []
+    mesh_tris = []
     mesh_lines = []
     mesh_colors = []
     for i in range(NUM_OBJECTS):
@@ -884,6 +905,10 @@ def run_desktop_preview():
         obj.lfo_move.freq_hz = 0.4
         obj.lfo_rot.freq_hz = 0.3
         objects.append(obj)
+        if ind is not None and len(ind) > 0:
+            mesh_tris.append(np.asarray(ind).reshape(-1).astype(np.int32))
+        else:
+            mesh_tris.append(None)
         mesh_lines.append(_tri_indices_to_lines(ind))
         mesh_colors.append(colors[i])
 
@@ -897,6 +922,9 @@ def run_desktop_preview():
         anchor_y="top",
         color=(255, 255, 255, 255),
     )
+
+    render_solid = True
+    render_wire = True
 
     start_time = time.time()
     last_time = start_time
@@ -913,6 +941,14 @@ def run_desktop_preview():
         if port:
             port.close()
         pyglet.app.exit()
+
+    @window.event
+    def on_key_press(symbol, modifiers):
+        nonlocal render_solid, render_wire
+        if symbol == pyglet.window.key.W:
+            render_wire = not render_wire
+        elif symbol == pyglet.window.key.F:
+            render_solid = not render_solid
 
     def set_perspective(fov_y_degrees, aspect, z_near, z_far):
         top = z_near * math.tan(math.radians(fov_y_degrees * 0.5))
@@ -988,25 +1024,65 @@ def run_desktop_preview():
         gl.glLoadIdentity()
         gl.glTranslatef(0.0, 0.0, -4.0)
 
+        # Helper for depth fog
+        def fog_factor(z):
+            return clamp((FOG_FAR - z) / (FOG_FAR - FOG_NEAR), 0.0, 1.0)
+
         for i, obj in enumerate(objects):
             if not obj.active:
                 continue
             verts = _transform_vertices(
                 obj.working_verts, obj.last_draw_pos, obj.last_draw_rot, obj.last_draw_scale
             )
+            tri_inds = mesh_tris[i]
             line_inds = mesh_lines[i]
             rgb = mesh_colors[i][:3]
-            if line_inds is not None:
+            if render_solid and tri_inds is not None:
+                gl.glEnable(gl.GL_POLYGON_OFFSET_FILL)
+                gl.glPolygonOffset(1.0, 1.0)
+                tri_verts = verts[tri_inds].astype(np.float32).ravel()
+                count = len(tri_inds)
+                # Compute average z for this triangle batch
+                z_avg = np.mean(verts[tri_inds][:, 2])
+                f = fog_factor(abs(z_avg))
+                fogged_rgb = (
+                    rgb[0] * f + FOG_COLOR[0] * (1.0 - f),
+                    rgb[1] * f + FOG_COLOR[1] * (1.0 - f),
+                    rgb[2] * f + FOG_COLOR[2] * (1.0 - f),
+                )
+                color_list = fogged_rgb * count
+                pyglet.graphics.draw(
+                    count, gl.GL_TRIANGLES, ("v3f", tri_verts), ("c3f", color_list)
+                )
+                gl.glDisable(gl.GL_POLYGON_OFFSET_FILL)
+
+            if render_wire and line_inds is not None:
                 line_verts = verts[line_inds].astype(np.float32).ravel()
                 count = len(line_inds)
-                color_list = rgb * count
+                # Compute average z for this line batch
+                z_avg = np.mean(verts[line_inds][:, 2])
+                f = fog_factor(abs(z_avg))
+                fogged_rgb = (
+                    rgb[0] * f + FOG_COLOR[0] * (1.0 - f),
+                    rgb[1] * f + FOG_COLOR[1] * (1.0 - f),
+                    rgb[2] * f + FOG_COLOR[2] * (1.0 - f),
+                )
+                color_list = fogged_rgb * count
                 pyglet.graphics.draw(
                     count, gl.GL_LINES, ("v3f", line_verts), ("c3f", color_list)
                 )
-            else:
+            elif render_wire and line_inds is None:
                 point_verts = verts.astype(np.float32).ravel()
                 count = len(verts)
-                color_list = rgb * count
+                # Compute average z for points
+                z_avg = np.mean(verts[:, 2])
+                f = fog_factor(abs(z_avg))
+                fogged_rgb = (
+                    rgb[0] * f + FOG_COLOR[0] * (1.0 - f),
+                    rgb[1] * f + FOG_COLOR[1] * (1.0 - f),
+                    rgb[2] * f + FOG_COLOR[2] * (1.0 - f),
+                )
+                color_list = fogged_rgb * count
                 pyglet.graphics.draw(
                     count, gl.GL_POINTS, ("v3f", point_verts), ("c3f", color_list)
                 )
@@ -1214,6 +1290,18 @@ def run_pi3d():
         shape = DeformShape(v, n, uv, ind, shader, color, camera=camera, light=light)
         return shape, shape._verts, shape._norms
 
+    # Helper for wireframe overlay
+    def make_wire(kind, color, camera=None):
+        v, _n, _uv, ind = make_mesh(kind)
+        line_inds = _tri_indices_to_lines(ind)
+        if line_inds is None or len(line_inds) == 0:
+            return None, None
+        pts = v[line_inds]
+        w = pi3d.Lines(vertices=pts, material=color, line_width=1, strip=False, camera=camera)
+        w.set_draw_details(wire_shader, [], 1.0, 1.0, 1.0, 1.0)
+        w.set_material(color)
+        return w, line_inds
+
     def make_debug_overlay(display):
         try:
             font = pi3d.Font("fonts/FreeSans.ttf", color=(255, 255, 255, 255))
@@ -1234,13 +1322,16 @@ def run_pi3d():
 
     display = pi3d.Display.create(x=0, y=0, w=1280, h=720, frames_per_second=60)
     display.set_background(0.02, 0.02, 0.02, 1.0)
+    # Enable subtle depth fog to match desktop preview
+    display.set_fog((0.02, 0.02, 0.02, 1.0), 2.0, 6.0)
     camera = pi3d.Camera(is_3d=True)
     light = pi3d.Light(
         lightpos=(3, 4, 6),
         lightcol=(0.9, 0.9, 0.9),
         lightamb=(0.2, 0.2, 0.2),
     )
-    shader = _load_shader("mat_flat")
+    shader = _load_shader("uv_flat")
+    wire_shader = _load_shader("uv_flat")
 
     colors = [
         (0.9, 0.6, 0.2, 1.0),
@@ -1259,6 +1350,7 @@ def run_pi3d():
     objects = []
     for i in range(NUM_OBJECTS):
         shape, v, n = make_shape(shapes[i], shader, colors[i], camera=camera, light=light)
+        wire, line_inds = make_wire(shapes[i], colors[i], camera=camera)
         obj = SynthObject(
             shape,
             v,
@@ -1266,6 +1358,8 @@ def run_pi3d():
             base_positions[i],
             colors[i],
             seed=1000 + i,
+            wire_shape=wire,
+            wire_line_inds=line_inds,
         )
         obj.lfo_scale.freq_hz = 0.5
         obj.lfo_move.freq_hz = 0.4
