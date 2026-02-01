@@ -153,6 +153,7 @@ class MidiState:
         self.cycle = False
         self.track_left = False
         self.track_right = False
+        self.rec_transport = False
         self.s_buttons_prev = self.s_buttons.copy()
         self.m_buttons_prev = self.m_buttons.copy()
         self.r_buttons_prev = self.r_buttons.copy()
@@ -160,6 +161,7 @@ class MidiState:
         self.cycle_prev = self.cycle
         self.track_left_prev = self.track_left
         self.track_right_prev = self.track_right
+        self.rec_transport_prev = self.rec_transport
 
     def capture_prev(self):
         self.s_buttons_prev = self.s_buttons.copy()
@@ -169,6 +171,7 @@ class MidiState:
         self.cycle_prev = self.cycle
         self.track_left_prev = self.track_left
         self.track_right_prev = self.track_right
+        self.rec_transport_prev = self.rec_transport
 
     def update_from_msg(self, msg):
         if msg.type != "control_change":
@@ -205,6 +208,8 @@ class MidiState:
             self.track_left = new_state
         elif cc == CC_TRACK_RIGHT:
             self.track_right = new_state
+        elif cc == CC_REC:
+            self.rec_transport = new_state
 
 
 # ---------- MIDI input
@@ -448,6 +453,9 @@ class SynthObject:
         self.lfo_scale = LFO()
         self.lfo_move = LFO()
         self.lfo_rot = LFO()
+        self.needs_rearm_scale = False
+        self.needs_rearm_move = False
+        self.needs_rearm_rot = False
 
         self.sculpt_mode = False
         self.zone_strengths = np.zeros(8, dtype=np.float32)
@@ -501,6 +509,25 @@ class SynthObject:
         self.zone_strengths[:] = 0.0
         self.boil_amount = 0.0
         self.boil_speed = 1.0
+
+    def reset_transforms(self):
+        self.pos[:] = self.base_pos
+        self.rot[:] = 0.0
+        self.scale = 1.0
+        self.last_draw_pos[:] = self.base_pos
+        self.last_draw_rot[:] = 0.0
+        self.last_draw_scale = self.scale
+
+    def reset_lfos(self):
+        self.lfo_scale.enabled = False
+        self.lfo_scale.amp = 0.0
+        self.lfo_scale.phase = 0.0
+        self.lfo_move.enabled = False
+        self.lfo_move.amp = 0.0
+        self.lfo_move.phase = 0.0
+        self.lfo_rot.enabled = False
+        self.lfo_rot.amp = 0.0
+        self.lfo_rot.phase = 0.0
 
     def set_transform_from_controls(self, midi_state, obj_idx):
         ch_a, ch_b = object_channel_indices(obj_idx)
@@ -565,8 +592,6 @@ class SynthObject:
         self.boil_speed = remap01(midi_state.knobs_f[ch_b], 0.3, 2.5)
 
     def _apply_zone_deform(self, v):
-        if not self.sculpt_mode:
-            return
         if not np.any(self.zone_strengths):
             return
         for i in range(8):
@@ -717,22 +742,27 @@ def resolve_intent(midi_state, sculpt_mode, sculpt_target_index):
     return modes
 
 
-def update_sculpt_state(midi_state, sculpt_mode, sculpt_target_index):
-    if button_rising(midi_state.cycle, midi_state.cycle_prev):
-        if sculpt_target_index is None:
-            sculpt_target_index = 0
-    if button_falling(midi_state.cycle, midi_state.cycle_prev):
-        sculpt_target_index = None
-    sculpt_mode = midi_state.cycle
+def update_sculpt_state(midi_state, sculpt_mode, sculpt_target_index, sculpt_rearm):
+    if sculpt_rearm:
+        if not midi_state.cycle:
+            sculpt_rearm = False
+        sculpt_mode = False
+    else:
+        if button_rising(midi_state.cycle, midi_state.cycle_prev):
+            if sculpt_target_index is None:
+                sculpt_target_index = 0
+        if button_falling(midi_state.cycle, midi_state.cycle_prev):
+            sculpt_target_index = None
+        sculpt_mode = midi_state.cycle
 
-    if sculpt_mode:
+    if sculpt_mode and not sculpt_rearm:
         if sculpt_target_index is None:
             sculpt_target_index = 0
         if button_rising(midi_state.track_left, midi_state.track_left_prev):
             sculpt_target_index = (sculpt_target_index - 1) % NUM_OBJECTS
         if button_rising(midi_state.track_right, midi_state.track_right_prev):
             sculpt_target_index = (sculpt_target_index + 1) % NUM_OBJECTS
-    return sculpt_mode, sculpt_target_index
+    return sculpt_mode, sculpt_target_index, sculpt_rearm
 
 
 def update_active_toggles(midi_state, active_toggles):
@@ -740,6 +770,17 @@ def update_active_toggles(midi_state, active_toggles):
         if button_rising(midi_state.transport[i], midi_state.transport_prev[i]):
             active_toggles[i] = not active_toggles[i]
     return active_toggles
+
+
+def apply_reset(objects, midi_state):
+    for i, obj in enumerate(objects):
+        obj.reset_deformation()
+        obj.reset_transforms()
+        obj.reset_lfos()
+        s_active, m_active, r_active = object_button_states(midi_state, i)
+        obj.needs_rearm_scale = s_active
+        obj.needs_rearm_move = m_active
+        obj.needs_rearm_rot = r_active
 
 
 def apply_controls(objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index):
@@ -752,9 +793,16 @@ def apply_controls(objects, midi_state, active_toggles, sculpt_mode, sculpt_targ
             obj.exit_sculpt_mode()
 
         s_active, m_active, r_active = object_button_states(midi_state, i)
-        obj.lfo_scale.enabled = s_active
-        obj.lfo_move.enabled = m_active
-        obj.lfo_rot.enabled = r_active
+        if obj.needs_rearm_scale and not s_active:
+            obj.needs_rearm_scale = False
+        if obj.needs_rearm_move and not m_active:
+            obj.needs_rearm_move = False
+        if obj.needs_rearm_rot and not r_active:
+            obj.needs_rearm_rot = False
+
+        obj.lfo_scale.enabled = s_active and not obj.needs_rearm_scale
+        obj.lfo_move.enabled = m_active and not obj.needs_rearm_move
+        obj.lfo_rot.enabled = r_active and not obj.needs_rearm_rot
 
         mode = modes[i]
         if sculpt_mode:
@@ -857,6 +905,8 @@ def run_desktop_preview():
     sculpt_mode = False
     sculpt_target_index = None
     active_toggles = [False] * NUM_OBJECTS
+    sculpt_rearm = False
+    sculpt_rearm = False
 
     @window.event
     def on_close():
@@ -916,7 +966,7 @@ def run_desktop_preview():
         label.draw()
 
     def update(_dt):
-        nonlocal last_time, fps_smooth, active_state, sculpt_mode, sculpt_target_index, active_toggles
+    nonlocal last_time, fps_smooth, active_state, sculpt_mode, sculpt_target_index, active_toggles, sculpt_rearm
         now = time.time()
         dt = now - last_time
         last_time = now
@@ -931,9 +981,15 @@ def run_desktop_preview():
                     print(msg)
                 midi_state.update_from_msg(msg)
 
+        if button_rising(midi_state.rec_transport, midi_state.rec_transport_prev):
+            apply_reset(objects, midi_state)
+            sculpt_mode = False
+            sculpt_target_index = 0
+            sculpt_rearm = midi_state.cycle
+
         active_toggles = update_active_toggles(midi_state, active_toggles)
-        sculpt_mode, sculpt_target_index = update_sculpt_state(
-            midi_state, sculpt_mode, sculpt_target_index
+        sculpt_mode, sculpt_target_index, sculpt_rearm = update_sculpt_state(
+            midi_state, sculpt_mode, sculpt_target_index, sculpt_rearm
         )
         active_state, modes = apply_controls(
             objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
@@ -1023,9 +1079,15 @@ def run_headless_mac():
                     midi_state.update_from_msg(msg)
                     midi_msgs_since_status += 1
 
+            if button_rising(midi_state.rec_transport, midi_state.rec_transport_prev):
+                apply_reset(objects, midi_state)
+                sculpt_mode = False
+                sculpt_target_index = 0
+                sculpt_rearm = midi_state.cycle
+
             active_toggles = update_active_toggles(midi_state, active_toggles)
-            sculpt_mode, sculpt_target_index = update_sculpt_state(
-                midi_state, sculpt_mode, sculpt_target_index
+            sculpt_mode, sculpt_target_index, sculpt_rearm = update_sculpt_state(
+                midi_state, sculpt_mode, sculpt_target_index, sculpt_rearm
             )
             active, modes = apply_controls(
                 objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
@@ -1222,6 +1284,7 @@ def run_pi3d():
     sculpt_mode = False
     sculpt_target_index = None
     active_toggles = [False] * NUM_OBJECTS
+    sculpt_rearm = False
 
     while display.loop_running():
         now = time.time()
@@ -1247,9 +1310,15 @@ def run_pi3d():
                 for obj in objects:
                     obj.reset_deformation()
 
+        if button_rising(midi_state.rec_transport, midi_state.rec_transport_prev):
+            apply_reset(objects, midi_state)
+            sculpt_mode = False
+            sculpt_target_index = 0
+            sculpt_rearm = midi_state.cycle
+
         active_toggles = update_active_toggles(midi_state, active_toggles)
-        sculpt_mode, sculpt_target_index = update_sculpt_state(
-            midi_state, sculpt_mode, sculpt_target_index
+        sculpt_mode, sculpt_target_index, sculpt_rearm = update_sculpt_state(
+            midi_state, sculpt_mode, sculpt_target_index, sculpt_rearm
         )
         active, modes = apply_controls(
             objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
