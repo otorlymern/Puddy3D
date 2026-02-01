@@ -2,17 +2,43 @@
 # Puddy3D - Pi3D + Mido (NanoKontrol2)
 # Raspberry Pi 3+ friendly
 import math
+import os
+import platform
 import time
-import numpy as np
 
-import pi3d
+import numpy as np
 from mido import get_input_names, open_input
 
+# Desktop preview requires: pip install pyglet
+try:
+    import pyglet
+    pyglet.options["gl_legacy"] = True
+except Exception:
+    pyglet = None
+
 PRINT_MIDI = False
+HEADLESS_STATUS_HZ = 5
+HEADLESS_FPS_LIMIT = 60
 NUM_OBJECTS = 4
 TAU = 2.0 * math.pi
+DEADZONE = 0.05
+
+BASE_X_RANGE = 1.44
+BASE_Y_RANGE = 1.44
+BASE_Z_RANGE = 1.2
+FAR_XY_BOOST = 0.5
+ROT_Y_RANGE = 180.0
 
 # MIDI mapping - ground-truth NanoKontrol2 CCs
+CC_PLAY = 41
+CC_STOP = 42
+CC_REW = 43
+CC_FF = 44
+CC_REC = 45
+CC_CYCLE = 46
+CC_TRACK_LEFT = 58
+CC_TRACK_RIGHT = 59
+
 MIDI_MAP = {
     "faders": [0, 1, 2, 3, 4, 5, 6, 7],
     "knobs": [16, 17, 18, 19, 20, 21, 22, 23],
@@ -20,7 +46,10 @@ MIDI_MAP = {
     "mute": [48, 49, 50, 51, 52, 53, 54, 55],
     "rec": [64, 65, 66, 67, 68, 69, 70, 71],
     # Transport buttons mapped to object toggles (Obj1..Obj4)
-    "transport": [41, 42, 43, 44],
+    "transport": [CC_PLAY, CC_STOP, CC_REW, CC_FF],
+    "cycle": [CC_CYCLE],
+    "track_left": [CC_TRACK_LEFT],
+    "track_right": [CC_TRACK_RIGHT],
 }
 
 MIDI_CC_TO_FADER = {cc: i for i, cc in enumerate(MIDI_MAP["faders"])}
@@ -37,12 +66,60 @@ MODE_LFO_ROT = "LFO_EDIT_ROT"
 MODE_SCULPT = "SCULPT"
 
 
+def detect_backend():
+    env = os.getenv("PUDDY_BACKEND", "").strip().lower()
+    if env in ("desktop", "preview"):
+        return "desktop"
+    if env in ("mac", "headless", "darwin"):
+        return "mac"
+    if env in ("pi", "pi3d", "linux"):
+        return "pi"
+    sysname = platform.system()
+    if sysname == "Darwin":
+        return "desktop" if pyglet is not None else "mac"
+    return "pi"
+
+
 def remap01(v, lo, hi):
     return lo + (hi - lo) * v
 
 
 def unit_to_bipolar(v):
     return v * 2.0 - 1.0
+
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def apply_deadzone(x, dz=DEADZONE):
+    ax = abs(x)
+    if ax <= dz:
+        return 0.0
+    scaled = (ax - dz) / (1.0 - dz)
+    return math.copysign(scaled, x)
+
+
+def norm_bipolar(unit_value, dz=DEADZONE):
+    x = unit_value * 2.0 - 1.0
+    x = apply_deadzone(x, dz)
+    return clamp(x, -1.0, 1.0)
+
+
+def norm_unipolar(unit_value):
+    return clamp(unit_value, 0.0, 1.0)
+
+
+def button_changed(new, old):
+    return new != old
+
+
+def button_rising(new, old):
+    return new and not old
+
+
+def button_falling(new, old):
+    return old and not new
 
 
 class LFO:
@@ -73,7 +150,25 @@ class MidiState:
         self.m_buttons = [False] * 8
         self.r_buttons = [False] * 8
         self.transport = [False] * NUM_OBJECTS
-        self._last_cc = {}
+        self.cycle = False
+        self.track_left = False
+        self.track_right = False
+        self.s_buttons_prev = self.s_buttons.copy()
+        self.m_buttons_prev = self.m_buttons.copy()
+        self.r_buttons_prev = self.r_buttons.copy()
+        self.transport_prev = self.transport.copy()
+        self.cycle_prev = self.cycle
+        self.track_left_prev = self.track_left
+        self.track_right_prev = self.track_right
+
+    def capture_prev(self):
+        self.s_buttons_prev = self.s_buttons.copy()
+        self.m_buttons_prev = self.m_buttons.copy()
+        self.r_buttons_prev = self.r_buttons.copy()
+        self.transport_prev = self.transport.copy()
+        self.cycle_prev = self.cycle
+        self.track_left_prev = self.track_left
+        self.track_right_prev = self.track_right
 
     def update_from_msg(self, msg):
         if msg.type != "control_change":
@@ -91,40 +186,58 @@ class MidiState:
             self.knobs[idx] = val
             self.knobs_f[idx] = val * (1.0 / 127.0)
             return
-
-        last_val = self._last_cc.get(cc, 0)
-        is_press = val > 0 and last_val == 0
-        self._last_cc[cc] = val
-        if not is_press:
-            return
-
+        new_state = val > 0
         if cc in MIDI_CC_TO_S:
             idx = MIDI_CC_TO_S[cc]
-            self.s_buttons[idx] = not self.s_buttons[idx]
+            self.s_buttons[idx] = new_state
         elif cc in MIDI_CC_TO_M:
             idx = MIDI_CC_TO_M[cc]
-            self.m_buttons[idx] = not self.m_buttons[idx]
+            self.m_buttons[idx] = new_state
         elif cc in MIDI_CC_TO_R:
             idx = MIDI_CC_TO_R[cc]
-            self.r_buttons[idx] = not self.r_buttons[idx]
+            self.r_buttons[idx] = new_state
         elif cc in MIDI_CC_TO_TRANSPORT:
             idx = MIDI_CC_TO_TRANSPORT[cc]
-            self.transport[idx] = not self.transport[idx]
+            self.transport[idx] = new_state
+        elif cc == CC_CYCLE:
+            self.cycle = new_state
+        elif cc == CC_TRACK_LEFT:
+            self.track_left = new_state
+        elif cc == CC_TRACK_RIGHT:
+            self.track_right = new_state
 
 
 # ---------- MIDI input
 
-def open_nanoport():
+def list_midi_inputs():
     names = get_input_names()
+    if names:
+        print("MIDI inputs:")
+        for name in names:
+            print(" - {}".format(name))
+    else:
+        print("MIDI inputs: none")
+    return names
+
+
+def open_nanoport(names=None, quiet_no_input=False):
+    if names is None:
+        names = get_input_names()
     port_name = None
     for n in names:
-        if "nano" in n.lower():
+        if "nanokontrol2" in n.lower():
             port_name = n
             break
+    if port_name is None:
+        for n in names:
+            if "nano" in n.lower():
+                port_name = n
+                break
     if port_name is None and names:
         port_name = names[0]
     if port_name is None:
-        print("No MIDI input found. Continue without MIDI.")
+        if not quiet_no_input:
+            print("No MIDI input found. Continue without MIDI.")
         return None
     print("MIDI input:", port_name)
     return open_input(port_name)
@@ -319,66 +432,6 @@ def _coerce_mesh_arrays(verts, norms, uvs, inds):
     return v, n, uv, ind
 
 
-def _load_shader(name, fallback="uv_flat"):
-    try:
-        return pi3d.Shader(name)
-    except Exception as exc:
-        print("Shader '{}' unavailable ({}); falling back to '{}'".format(name, exc, fallback))
-        return pi3d.Shader(fallback)
-
-
-class DeformShape(pi3d.Shape):
-    def __init__(
-        self,
-        verts,
-        norms,
-        uvs,
-        inds,
-        shader,
-        color,
-        camera=None,
-        light=None,
-        name="deform",
-        x=0.0,
-        y=0.0,
-        z=0.0,
-        rx=0.0,
-        ry=0.0,
-        rz=0.0,
-        sx=1.0,
-        sy=1.0,
-        sz=1.0,
-        cx=0.0,
-        cy=0.0,
-        cz=0.0,
-    ):
-        super().__init__(
-            camera=camera,
-            light=light,
-            name=name,
-            x=x,
-            y=y,
-            z=z,
-            rx=rx,
-            ry=ry,
-            rz=rz,
-            sx=sx,
-            sy=sy,
-            sz=sz,
-            cx=cx,
-            cy=cy,
-            cz=cz,
-        )
-        v, n, uv, ind = _coerce_mesh_arrays(verts, norms, uvs, inds)
-        self._verts = v
-        self._norms = n
-        self._uvs = uv
-        self._inds = ind
-        self.buf = [pi3d.Buffer(self, v, uv, ind, n)]
-        self.set_draw_details(shader, [], 1.0, 1.0, 1.0, 1.0)
-        self.set_material(color)
-
-
 class SynthObject:
     def __init__(self, shape, base_verts, base_norms, base_pos, color, seed):
         self.shape = shape
@@ -388,6 +441,9 @@ class SynthObject:
         self.rot = np.zeros(3, dtype=np.float32)
         self.scale = 1.0
         self.color = color
+        self.last_draw_pos = self.base_pos.copy()
+        self.last_draw_rot = self.rot.copy()
+        self.last_draw_scale = self.scale
 
         self.lfo_scale = LFO()
         self.lfo_move = LFO()
@@ -453,10 +509,28 @@ class SynthObject:
         f_a = midi_state.faders_f[ch_a]
         f_b = midi_state.faders_f[ch_b]
 
-        pos_x = unit_to_bipolar(k_a) * 1.2
-        pos_y = unit_to_bipolar(k_b) * 0.9
-        pos_z = unit_to_bipolar(f_a) * 1.2
-        rot_y = unit_to_bipolar(f_b) * 180.0
+        x_norm = norm_bipolar(k_a)
+        y_norm = norm_bipolar(k_b)
+        z_norm = norm_bipolar(f_a)
+        rot_norm = norm_bipolar(f_b)
+
+        z_depth = (1.0 - z_norm) * 0.5
+        xy_scale = 1.0 + FAR_XY_BOOST * z_depth
+        x_range = BASE_X_RANGE * xy_scale
+        y_range = BASE_Y_RANGE * xy_scale
+
+        pos_x = x_norm * x_range
+        pos_y = y_norm * y_range
+        pos_z = z_norm * BASE_Z_RANGE
+        rot_y = rot_norm * ROT_Y_RANGE
+
+        x_frac = abs(pos_x) / x_range if x_range > 1e-6 else 0.0
+        y_frac = abs(pos_y) / y_range if y_range > 1e-6 else 0.0
+        xy_mag = min(1.0, (x_frac + y_frac) * 0.5)
+        if xy_mag < 0.5:
+            bonus = (0.5 - xy_mag) / 0.5
+            pos_z += bonus * (BASE_Z_RANGE * 0.5)
+        pos_z = clamp(pos_z, -BASE_Z_RANGE, BASE_Z_RANGE * 1.5)
 
         self.rot[0] = 0.0
         self.rot[1] = rot_y
@@ -484,9 +558,8 @@ class SynthObject:
             self.lfo_rot.amp = amp
 
     def set_sculpt_params_from_controls(self, midi_state, obj_idx):
-        self.zone_strengths[:] = midi_state.faders_f
-        self.zone_strengths *= 2.0
-        self.zone_strengths -= 1.0
+        for i in range(8):
+            self.zone_strengths[i] = norm_bipolar(midi_state.faders_f[i])
         ch_a, ch_b = object_channel_indices(obj_idx)
         self.boil_amount = midi_state.knobs_f[ch_a]
         self.boil_speed = remap01(midi_state.knobs_f[ch_b], 0.3, 2.5)
@@ -526,7 +599,8 @@ class SynthObject:
         self._apply_zone_deform(v)
         self._apply_boil(v, t)
 
-        self.shape.buf[0].re_init(pts=v)
+        if self.shape is not None:
+            self.shape.buf[0].re_init(pts=v)
 
         lfo_scale = self.lfo_scale.tick(t, dt)
         lfo_move = self.lfo_move.tick(t, dt)
@@ -541,14 +615,23 @@ class SynthObject:
         rot_y = self.rot[1] + self.rot_axis[1] * lfo_rot
         rot_z = self.rot[2] + self.rot_axis[2] * lfo_rot
 
-        self.shape.position(pos_x, pos_y, pos_z)
-        self.shape.rotateToX(rot_x)
-        self.shape.rotateToY(rot_y)
-        self.shape.rotateToZ(rot_z)
-        self.shape.scale(scale, scale, scale)
+        self.last_draw_pos[0] = pos_x
+        self.last_draw_pos[1] = pos_y
+        self.last_draw_pos[2] = pos_z
+        self.last_draw_rot[0] = rot_x
+        self.last_draw_rot[1] = rot_y
+        self.last_draw_rot[2] = rot_z
+        self.last_draw_scale = scale
+
+        if self.shape is not None:
+            self.shape.position(pos_x, pos_y, pos_z)
+            self.shape.rotateToX(rot_x)
+            self.shape.rotateToY(rot_y)
+            self.shape.rotateToZ(rot_z)
+            self.shape.scale(scale, scale, scale)
 
     def draw(self):
-        if self.active:
+        if self.active and self.shape is not None:
             self.shape.draw()
 
 
@@ -565,7 +648,7 @@ def object_button_states(midi_state, obj_idx):
     return s_active, m_active, r_active
 
 
-def make_shape(kind, shader, color, camera=None, light=None):
+def make_mesh(kind):
     if kind == 1:
         v, n, uv, ind = gen_uvsphere(12, 8, 1.0)
     elif kind == 2:
@@ -574,24 +657,52 @@ def make_shape(kind, shader, color, camera=None, light=None):
         v, n, uv, ind = gen_cone(8, 0.6, 1.2)
     else:
         v, n, uv, ind = gen_cylinder(10, 0.6, 1.2)
-
-    shape = DeformShape(v, n, uv, ind, shader, color, camera=camera, light=light)
-    return shape, shape._verts, shape._norms
+    return v, n, uv, ind
 
 
-def resolve_intent(midi_state):
-    active = list(midi_state.transport)
+def _tri_indices_to_lines(inds):
+    if inds is None:
+        return None
+    ind = np.asarray(inds)
+    if ind.size == 0:
+        return None
+    if ind.ndim == 2:
+        ind = ind.reshape(-1)
+    line_inds = []
+    for i in range(0, len(ind), 3):
+        a = int(ind[i])
+        b = int(ind[i + 1])
+        c = int(ind[i + 2])
+        line_inds.extend([a, b, b, c, c, a])
+    return np.array(line_inds, dtype=np.int32)
 
-    sculpt_candidates = []
-    for i in range(NUM_OBJECTS):
-        s_active, m_active, r_active = object_button_states(midi_state, i)
-        if s_active and m_active and r_active:
-            sculpt_candidates.append(i)
-    sculpt_idx = min(sculpt_candidates) if sculpt_candidates else None
 
+def _rotation_matrix_xyz(rot_deg):
+    rx, ry, rz = np.radians(rot_deg)
+    cx = math.cos(rx)
+    sx = math.sin(rx)
+    cy = math.cos(ry)
+    sy = math.sin(ry)
+    cz = math.cos(rz)
+    sz = math.sin(rz)
+    rxm = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float32)
+    rym = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float32)
+    rzm = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    return rzm @ rym @ rxm
+
+
+def _transform_vertices(verts, pos, rot_deg, scale):
+    v = verts * scale
+    r = _rotation_matrix_xyz(rot_deg)
+    v = v @ r.T
+    v = v + pos
+    return v
+
+
+def resolve_intent(midi_state, sculpt_mode, sculpt_target_index):
     modes = []
     for i in range(NUM_OBJECTS):
-        if sculpt_idx == i:
+        if sculpt_mode and sculpt_target_index == i:
             modes.append(MODE_SCULPT)
             continue
         s_active, m_active, r_active = object_button_states(midi_state, i)
@@ -603,29 +714,461 @@ def resolve_intent(midi_state):
             modes.append(MODE_LFO_ROT)
         else:
             modes.append(MODE_NORMAL)
-    return active, sculpt_idx, modes
+    return modes
 
 
-def make_debug_overlay(display):
-    try:
-        font = pi3d.Font("fonts/FreeSans.ttf", color=(255, 255, 255, 255))
-        cam2d = pi3d.Camera(is_3d=False)
-        point_text = pi3d.PointText(font, cam2d, max_chars=128, point_size=24)
-        block = pi3d.TextBlock(
-            x=-display.width / 2 + 10,
-            y=display.height / 2 - 20,
-            z=1.0,
-            rot=0.0,
-            char_count=128,
-            text_format="",
+def update_sculpt_state(midi_state, sculpt_mode, sculpt_target_index):
+    if button_rising(midi_state.cycle, midi_state.cycle_prev):
+        if sculpt_target_index is None:
+            sculpt_target_index = 0
+    if button_falling(midi_state.cycle, midi_state.cycle_prev):
+        sculpt_target_index = None
+    sculpt_mode = midi_state.cycle
+
+    if sculpt_mode:
+        if sculpt_target_index is None:
+            sculpt_target_index = 0
+        if button_rising(midi_state.track_left, midi_state.track_left_prev):
+            sculpt_target_index = (sculpt_target_index - 1) % NUM_OBJECTS
+        if button_rising(midi_state.track_right, midi_state.track_right_prev):
+            sculpt_target_index = (sculpt_target_index + 1) % NUM_OBJECTS
+    return sculpt_mode, sculpt_target_index
+
+
+def update_active_toggles(midi_state, active_toggles):
+    for i in range(min(NUM_OBJECTS, len(midi_state.transport))):
+        if button_rising(midi_state.transport[i], midi_state.transport_prev[i]):
+            active_toggles[i] = not active_toggles[i]
+    return active_toggles
+
+
+def apply_controls(objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index):
+    modes = resolve_intent(midi_state, sculpt_mode, sculpt_target_index)
+    for i, obj in enumerate(objects):
+        obj.active = active_toggles[i]
+        if sculpt_mode and sculpt_target_index == i:
+            obj.enter_sculpt_mode()
+        else:
+            obj.exit_sculpt_mode()
+
+        s_active, m_active, r_active = object_button_states(midi_state, i)
+        obj.lfo_scale.enabled = s_active
+        obj.lfo_move.enabled = m_active
+        obj.lfo_rot.enabled = r_active
+
+        mode = modes[i]
+        if sculpt_mode:
+            if mode == MODE_SCULPT and sculpt_target_index is not None:
+                obj.set_sculpt_params_from_controls(midi_state, i)
+            continue
+
+        if mode == MODE_NORMAL:
+            obj.set_transform_from_controls(midi_state, i)
+        elif mode == MODE_LFO_SCALE and obj.lfo_scale.enabled:
+            obj.set_lfo_params_from_controls(midi_state, i, "scale")
+        elif mode == MODE_LFO_MOVE and obj.lfo_move.enabled:
+            obj.set_lfo_params_from_controls(midi_state, i, "move")
+        elif mode == MODE_LFO_ROT and obj.lfo_rot.enabled:
+            obj.set_lfo_params_from_controls(midi_state, i, "rot")
+    return active_toggles, modes
+
+
+def lfo_state_summary(midi_state):
+    parts = []
+    for i in range(NUM_OBJECTS):
+        s_active, m_active, r_active = object_button_states(midi_state, i)
+        parts.append(
+            "{}{}{}".format("S" if s_active else "-", "M" if m_active else "-", "R" if r_active else "-")
         )
-        point_text.add_text_block(block)
-        return point_text, block
-    except Exception:
-        return None, None
+    return " ".join(parts)
 
 
-def main():
+def run_desktop_preview():
+    try:
+        global pyglet
+        if pyglet is None:
+            import pyglet as _pyglet
+            _pyglet.options["gl_legacy"] = True
+            pyglet = _pyglet
+        from pyglet.gl import gl
+    except Exception as exc:
+        print("pyglet import failed ({}). Install with: pip install pyglet".format(exc))
+        run_headless_mac()
+        return
+
+    window = pyglet.window.Window(1280, 720, caption="Puddy3D Preview", resizable=True)
+    gl.glClearColor(0.02, 0.02, 0.02, 1.0)
+    gl.glEnable(gl.GL_DEPTH_TEST)
+    gl.glPointSize(2.0)
+
+    names = list_midi_inputs()
+    port = open_nanoport(names=names, quiet_no_input=True)
+    midi_state = MidiState()
+
+    colors = [
+        (0.9, 0.6, 0.2, 1.0),
+        (0.2, 0.8, 0.9, 1.0),
+        (0.9, 0.3, 0.5, 1.0),
+        (0.6, 0.9, 0.4, 1.0),
+    ]
+    base_positions = [
+        (-0.7, 0.0, 0.0),
+        (0.7, 0.0, 0.0),
+        (0.0, 0.0, -0.7),
+        (0.0, 0.0, 0.7),
+    ]
+    shapes = [1, 2, 3, 4]
+
+    objects = []
+    mesh_lines = []
+    mesh_colors = []
+    for i in range(NUM_OBJECTS):
+        v, n, _uv, ind = make_mesh(shapes[i])
+        obj = SynthObject(
+            None,
+            v,
+            n,
+            base_positions[i],
+            colors[i],
+            seed=1000 + i,
+        )
+        obj.lfo_scale.freq_hz = 0.5
+        obj.lfo_move.freq_hz = 0.4
+        obj.lfo_rot.freq_hz = 0.3
+        objects.append(obj)
+        mesh_lines.append(_tri_indices_to_lines(ind))
+        mesh_colors.append(colors[i])
+
+    label = pyglet.text.Label(
+        "",
+        font_name="Courier",
+        font_size=12,
+        x=10,
+        y=window.height - 10,
+        anchor_x="left",
+        anchor_y="top",
+        color=(255, 255, 255, 255),
+    )
+
+    start_time = time.time()
+    last_time = start_time
+    fps_smooth = 0.0
+    active_state = [False] * NUM_OBJECTS
+    sculpt_mode = False
+    sculpt_target_index = None
+    active_toggles = [False] * NUM_OBJECTS
+
+    @window.event
+    def on_close():
+        if port:
+            port.close()
+        pyglet.app.exit()
+
+    def set_perspective(fov_y_degrees, aspect, z_near, z_far):
+        top = z_near * math.tan(math.radians(fov_y_degrees * 0.5))
+        bottom = -top
+        right = top * aspect
+        left = -right
+        gl.glFrustum(left, right, bottom, top, z_near, z_far)
+
+    @window.event
+    def on_resize(width, height):
+        gl.glViewport(0, 0, width, height)
+        gl.glMatrixMode(gl.GL_PROJECTION)
+        gl.glLoadIdentity()
+        aspect = float(width) / float(height) if height else 1.0
+        set_perspective(60.0, aspect, 0.1, 100.0)
+        gl.glMatrixMode(gl.GL_MODELVIEW)
+        gl.glLoadIdentity()
+        return pyglet.event.EVENT_HANDLED
+
+    @window.event
+    def on_draw():
+        window.clear()
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+        gl.glMatrixMode(gl.GL_MODELVIEW)
+        gl.glLoadIdentity()
+        gl.glTranslatef(0.0, 0.0, -4.0)
+
+        for i, obj in enumerate(objects):
+            if not obj.active:
+                continue
+            verts = _transform_vertices(
+                obj.working_verts, obj.last_draw_pos, obj.last_draw_rot, obj.last_draw_scale
+            )
+            line_inds = mesh_lines[i]
+            rgb = mesh_colors[i][:3]
+            if line_inds is not None:
+                line_verts = verts[line_inds].astype(np.float32).ravel()
+                count = len(line_inds)
+                color_list = rgb * count
+                pyglet.graphics.draw(
+                    count, gl.GL_LINES, ("v3f", line_verts), ("c3f", color_list)
+                )
+            else:
+                point_verts = verts.astype(np.float32).ravel()
+                count = len(verts)
+                color_list = rgb * count
+                pyglet.graphics.draw(
+                    count, gl.GL_POINTS, ("v3f", point_verts), ("c3f", color_list)
+                )
+
+        label.draw()
+
+    def update(_dt):
+        nonlocal last_time, fps_smooth, active_state, sculpt_mode, sculpt_target_index, active_toggles
+        now = time.time()
+        dt = now - last_time
+        last_time = now
+        t = now - start_time
+        if dt <= 0.0:
+            dt = 1.0 / 60.0
+
+        midi_state.capture_prev()
+        if port:
+            for msg in port.iter_pending():
+                if PRINT_MIDI:
+                    print(msg)
+                midi_state.update_from_msg(msg)
+
+        active_toggles = update_active_toggles(midi_state, active_toggles)
+        sculpt_mode, sculpt_target_index = update_sculpt_state(
+            midi_state, sculpt_mode, sculpt_target_index
+        )
+        active_state, modes = apply_controls(
+            objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
+        )
+
+        for obj in objects:
+            obj.update(t, dt)
+
+        inst_fps = 1.0 / dt if dt > 0.0 else 0.0
+        fps_smooth = fps_smooth * 0.9 + inst_fps * 0.1
+        active_list = [str(i + 1) for i, a in enumerate(active_state) if a]
+        active_text = ",".join(active_list) if active_list else "none"
+        sculpt_label = "none"
+        if sculpt_mode and sculpt_target_index is not None:
+            sculpt_label = "ON {}".format(sculpt_target_index + 1)
+        elif sculpt_mode:
+            sculpt_label = "ON"
+        lfo_summary = lfo_state_summary(midi_state)
+        label.text = "FPS: {:.1f}\nActive: {}\nSculpt: {}\nLFO: {}".format(
+            fps_smooth, active_text, sculpt_label, lfo_summary
+        )
+        label.y = window.height - 10
+
+    pyglet.clock.schedule_interval(update, 1.0 / 60.0)
+    pyglet.app.run()
+
+
+def run_headless_mac():
+    names = list_midi_inputs()
+    port = open_nanoport(names=names, quiet_no_input=True)
+    midi_state = MidiState()
+
+    colors = [
+        (0.9, 0.6, 0.2, 1.0),
+        (0.2, 0.8, 0.9, 1.0),
+        (0.9, 0.3, 0.5, 1.0),
+        (0.6, 0.9, 0.4, 1.0),
+    ]
+    base_positions = [
+        (-0.7, 0.0, 0.0),
+        (0.7, 0.0, 0.0),
+        (0.0, 0.0, -0.7),
+        (0.0, 0.0, 0.7),
+    ]
+    shapes = [1, 2, 3, 4]
+
+    objects = []
+    for i in range(NUM_OBJECTS):
+        v, n, _uv, _ind = make_mesh(shapes[i])
+        obj = SynthObject(
+            None,
+            v,
+            n,
+            base_positions[i],
+            colors[i],
+            seed=1000 + i,
+        )
+        obj.lfo_scale.freq_hz = 0.5
+        obj.lfo_move.freq_hz = 0.4
+        obj.lfo_rot.freq_hz = 0.3
+        objects.append(obj)
+
+    sculpt_mode = False
+    sculpt_target_index = None
+    active_toggles = [False] * NUM_OBJECTS
+
+    start_time = time.time()
+    last_time = start_time
+    last_status = 0.0
+    status_interval = 1.0 / float(HEADLESS_STATUS_HZ) if HEADLESS_STATUS_HZ > 0 else None
+    midi_msgs_since_status = 0
+
+    try:
+        while True:
+            loop_start = time.time()
+            dt = loop_start - last_time
+            last_time = loop_start
+            t = loop_start - start_time
+            if dt <= 0.0:
+                dt = 1.0 / 60.0
+
+            midi_state.capture_prev()
+            if port:
+                for msg in port.iter_pending():
+                    if PRINT_MIDI:
+                        print(msg)
+                    midi_state.update_from_msg(msg)
+                    midi_msgs_since_status += 1
+
+            active_toggles = update_active_toggles(midi_state, active_toggles)
+            sculpt_mode, sculpt_target_index = update_sculpt_state(
+                midi_state, sculpt_mode, sculpt_target_index
+            )
+            active, modes = apply_controls(
+                objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
+            )
+
+            for obj in objects:
+                obj.update(t, dt)
+
+            if status_interval and (t - last_status) >= status_interval:
+                active_list = [str(i + 1) for i, a in enumerate(active) if a]
+                active_text = ",".join(active_list) if active_list else "none"
+                sculpt_label = "none"
+                if sculpt_mode and sculpt_target_index is not None:
+                    sculpt_label = "on:{}".format(sculpt_target_index + 1)
+                elif sculpt_mode:
+                    sculpt_label = "on"
+                obj0 = objects[0] if objects else None
+                if obj0 is not None:
+                    pos = obj0.last_draw_pos
+                    status = (
+                        "dt={:.3f} active={} sculpt={} o1pos=({:.2f},{:.2f},{:.2f}) "
+                        "scale={:.2f} boil={:.2f} midi={}"
+                    ).format(
+                        dt,
+                        active_text,
+                        sculpt_label,
+                        pos[0],
+                        pos[1],
+                        pos[2],
+                        obj0.last_draw_scale,
+                        obj0.boil_amount,
+                        midi_msgs_since_status,
+                    )
+                else:
+                    status = "dt={:.3f} active={} sculpt={} midi={}".format(
+                        dt, active_text, sculpt_label, midi_msgs_since_status
+                    )
+                print(status)
+                midi_msgs_since_status = 0
+                last_status = t
+
+            if HEADLESS_FPS_LIMIT and HEADLESS_FPS_LIMIT > 0:
+                min_frame = 1.0 / float(HEADLESS_FPS_LIMIT)
+                elapsed = time.time() - loop_start
+                if elapsed < min_frame:
+                    time.sleep(min_frame - elapsed)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if port:
+            port.close()
+
+
+def run_pi3d():
+    try:
+        import pi3d
+    except Exception as exc:
+        print(
+            "pi3d import failed ({}). Set PUDDY_BACKEND=mac to run headless.".format(exc)
+        )
+        return
+
+    def _load_shader(name, fallback="uv_flat"):
+        try:
+            return pi3d.Shader(name)
+        except Exception as exc:
+            print("Shader '{}' unavailable ({}); falling back to '{}'".format(name, exc, fallback))
+            return pi3d.Shader(fallback)
+
+    class DeformShape(pi3d.Shape):
+        def __init__(
+            self,
+            verts,
+            norms,
+            uvs,
+            inds,
+            shader,
+            color,
+            camera=None,
+            light=None,
+            name="deform",
+            x=0.0,
+            y=0.0,
+            z=0.0,
+            rx=0.0,
+            ry=0.0,
+            rz=0.0,
+            sx=1.0,
+            sy=1.0,
+            sz=1.0,
+            cx=0.0,
+            cy=0.0,
+            cz=0.0,
+        ):
+            super().__init__(
+                camera=camera,
+                light=light,
+                name=name,
+                x=x,
+                y=y,
+                z=z,
+                rx=rx,
+                ry=ry,
+                rz=rz,
+                sx=sx,
+                sy=sy,
+                sz=sz,
+                cx=cx,
+                cy=cy,
+                cz=cz,
+            )
+            v, n, uv, ind = _coerce_mesh_arrays(verts, norms, uvs, inds)
+            self._verts = v
+            self._norms = n
+            self._uvs = uv
+            self._inds = ind
+            self.buf = [pi3d.Buffer(self, v, uv, ind, n)]
+            self.set_draw_details(shader, [], 1.0, 1.0, 1.0, 1.0)
+            self.set_material(color)
+
+    def make_shape(kind, shader, color, camera=None, light=None):
+        v, n, uv, ind = make_mesh(kind)
+        shape = DeformShape(v, n, uv, ind, shader, color, camera=camera, light=light)
+        return shape, shape._verts, shape._norms
+
+    def make_debug_overlay(display):
+        try:
+            font = pi3d.Font("fonts/FreeSans.ttf", color=(255, 255, 255, 255))
+            cam2d = pi3d.Camera(is_3d=False)
+            point_text = pi3d.PointText(font, cam2d, max_chars=128, point_size=24)
+            block = pi3d.TextBlock(
+                x=-display.width / 2 + 10,
+                y=display.height / 2 - 20,
+                z=1.0,
+                rot=0.0,
+                char_count=128,
+                text_format="",
+            )
+            point_text.add_text_block(block)
+            return point_text, block
+        except Exception:
+            return None, None
+
     display = pi3d.Display.create(x=0, y=0, w=1280, h=720, frames_per_second=60)
     display.set_background(0.02, 0.02, 0.02, 1.0)
     camera = pi3d.Camera(is_3d=True)
@@ -676,6 +1219,9 @@ def main():
 
     start_time = time.time()
     last_time = start_time
+    sculpt_mode = False
+    sculpt_target_index = None
+    active_toggles = [False] * NUM_OBJECTS
 
     while display.loop_running():
         now = time.time()
@@ -685,6 +1231,7 @@ def main():
         if dt <= 0.0:
             dt = 1.0 / 60.0
 
+        midi_state.capture_prev()
         if port:
             for msg in port.iter_pending():
                 if PRINT_MIDI:
@@ -700,31 +1247,13 @@ def main():
                 for obj in objects:
                     obj.reset_deformation()
 
-        active, sculpt_idx, modes = resolve_intent(midi_state)
-
-        for i, obj in enumerate(objects):
-            obj.active = active[i]
-            if sculpt_idx == i:
-                obj.enter_sculpt_mode()
-            else:
-                obj.exit_sculpt_mode()
-
-            s_active, m_active, r_active = object_button_states(midi_state, i)
-            obj.lfo_scale.enabled = s_active
-            obj.lfo_move.enabled = m_active
-            obj.lfo_rot.enabled = r_active
-
-            mode = modes[i]
-            if mode == MODE_NORMAL:
-                obj.set_transform_from_controls(midi_state, i)
-            elif mode == MODE_LFO_SCALE:
-                obj.set_lfo_params_from_controls(midi_state, i, "scale")
-            elif mode == MODE_LFO_MOVE:
-                obj.set_lfo_params_from_controls(midi_state, i, "move")
-            elif mode == MODE_LFO_ROT:
-                obj.set_lfo_params_from_controls(midi_state, i, "rot")
-            elif mode == MODE_SCULPT:
-                obj.set_sculpt_params_from_controls(midi_state, i)
+        active_toggles = update_active_toggles(midi_state, active_toggles)
+        sculpt_mode, sculpt_target_index = update_sculpt_state(
+            midi_state, sculpt_mode, sculpt_target_index
+        )
+        active, modes = apply_controls(
+            objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
+        )
 
         camera.reset()
         camera.position((0.0, 0.0, 4.0))
@@ -737,7 +1266,11 @@ def main():
         if point_text and debug_block and (t - last_debug) > 0.25:
             inst_fps = 1.0 / dt if dt > 0.0 else 0.0
             fps = fps * 0.9 + inst_fps * 0.1
-            sculpt_label = "none" if sculpt_idx is None else str(sculpt_idx + 1)
+            sculpt_label = "off"
+            if sculpt_mode and sculpt_target_index is not None:
+                sculpt_label = "on:{}".format(sculpt_target_index + 1)
+            elif sculpt_mode:
+                sculpt_label = "on"
             active_list = [str(i + 1) for i, a in enumerate(active) if a]
             active_text = ",".join(active_list) if active_list else "none"
             debug_block.set_text(
@@ -753,6 +1286,16 @@ def main():
         port.close()
     kb.close()
     display.destroy()
+
+
+def main():
+    backend = detect_backend()
+    if backend == "desktop":
+        run_desktop_preview()
+    elif backend == "mac":
+        run_headless_mac()
+    else:
+        run_pi3d()
 
 
 if __name__ == "__main__":
