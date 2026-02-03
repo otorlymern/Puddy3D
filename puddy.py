@@ -461,6 +461,7 @@ class SynthObject:
 
         self.sculpt_mode = False
         self.zone_strengths = np.zeros(8, dtype=np.float32)
+        self.sculpt_layers = np.zeros(8, dtype=np.float32)
         self.boil_amount = 0.0
         self.boil_speed = 1.0
         self.sculpt_strength = 0.35
@@ -468,6 +469,7 @@ class SynthObject:
         self.base_verts = base_verts.astype(np.float32)
         self.working_verts = self.base_verts.copy()
         self.base_norms = base_norms.astype(np.float32)
+        self.bound_radius = float(np.max(np.linalg.norm(self.base_verts, axis=1)))
 
         self.zone_ids = (
             (self.base_verts[:, 0] > 0).astype(np.int8)
@@ -479,10 +481,22 @@ class SynthObject:
 
         rng = np.random.RandomState(seed)
         self.boil_seeds = rng.uniform(0.0, TAU, size=self.base_verts.shape).astype(np.float32)
+        self.crackle_seeds = rng.uniform(0.0, TAU, size=self.base_verts.shape[0]).astype(np.float32)
+        self.drift_seeds = rng.uniform(0.0, TAU, size=self.base_verts.shape[0]).astype(np.float32)
+        drift_dirs = rng.normal(size=self.base_verts.shape).astype(np.float32)
+        drift_norm = np.linalg.norm(drift_dirs, axis=1, keepdims=True) + 1e-6
+        self.drift_dirs = drift_dirs / drift_norm
+        bias_dir = rng.normal(size=3).astype(np.float32)
+        self.bias_dir = bias_dir / (np.linalg.norm(bias_dir) + 1e-6)
         self.boil_scale = 0.08
 
         self.move_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        self.move_lfo_mode = "none"
+        self.orbit_amp_x = 0.0
+        self.orbit_amp_y = 0.0
         self.rot_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        self.collision_dir = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        self.collision_strength = 0.0
 
     def _compute_zone_dirs(self):
         dirs = np.zeros((8, 3), dtype=np.float32)
@@ -509,8 +523,10 @@ class SynthObject:
 
     def reset_deformation(self):
         self.zone_strengths[:] = 0.0
+        self.sculpt_layers[:] = 0.0
         self.boil_amount = 0.0
         self.boil_speed = 1.0
+        self.collision_strength = 0.0
 
     def reset_transforms(self):
         self.pos[:] = self.base_pos
@@ -527,6 +543,8 @@ class SynthObject:
         self.lfo_move.enabled = False
         self.lfo_move.amp = 0.0
         self.lfo_move.phase = 0.0
+        self.orbit_amp_x = 0.0
+        self.orbit_amp_y = 0.0
         self.lfo_rot.enabled = False
         self.lfo_rot.amp = 0.0
         self.lfo_rot.phase = 0.0
@@ -572,16 +590,39 @@ class SynthObject:
         ch_a, ch_b = object_channel_indices(obj_idx)
         k_a = midi_state.knobs_f[ch_a]
         k_b = midi_state.knobs_f[ch_b]
-        freq = remap01(k_a, 0.05, 2.2)
         if target == "scale":
+            freq = remap01(k_a, 0.05, 2.2)
             amp = remap01(k_b, 0.0, 0.6)
             self.lfo_scale.freq_hz = freq
             self.lfo_scale.amp = amp
         elif target == "move":
-            amp = remap01(k_b, 0.0, 0.8)
-            self.lfo_move.freq_hz = freq
-            self.lfo_move.amp = amp
+            f_a = midi_state.faders_f[ch_a]
+            f_b = midi_state.faders_f[ch_b]
+            if self.move_lfo_mode == "orbit":
+                freq = remap01((k_a + k_b) * 0.5, 0.05, 2.2)
+                amp_x = remap01(f_a, 0.0, 0.8) * (0.25 + 0.75 * k_a)
+                amp_y = remap01(f_b, 0.0, 0.8) * (0.25 + 0.75 * k_b)
+                self.orbit_amp_x = amp_x
+                self.orbit_amp_y = amp_y
+                self.lfo_move.freq_hz = freq
+                self.lfo_move.amp = max(amp_x, amp_y, 1e-6)
+            elif self.move_lfo_mode == "x":
+                freq = remap01(k_a, 0.05, 2.2)
+                amp = remap01(f_a, 0.0, 0.8)
+                self.lfo_move.freq_hz = freq
+                self.lfo_move.amp = amp
+            elif self.move_lfo_mode == "y":
+                freq = remap01(k_b, 0.05, 2.2)
+                amp = remap01(f_b, 0.0, 0.8)
+                self.lfo_move.freq_hz = freq
+                self.lfo_move.amp = amp
+            else:
+                freq = remap01(k_a, 0.05, 2.2)
+                amp = remap01(k_b, 0.0, 0.8)
+                self.lfo_move.freq_hz = freq
+                self.lfo_move.amp = amp
         elif target == "rot":
+            freq = remap01(k_a, 0.05, 2.2)
             amp = remap01(k_b, 0.0, 90.0)
             self.lfo_rot.freq_hz = freq
             self.lfo_rot.amp = amp
@@ -589,9 +630,9 @@ class SynthObject:
     def set_sculpt_params_from_controls(self, midi_state, obj_idx):
         for i in range(8):
             self.zone_strengths[i] = norm_bipolar(midi_state.faders_f[i])
-        ch_a, ch_b = object_channel_indices(obj_idx)
-        self.boil_amount = midi_state.knobs_f[ch_a]
-        self.boil_speed = remap01(midi_state.knobs_f[ch_b], 0.3, 2.5)
+        self.sculpt_layers[:] = midi_state.knobs_f[:8]
+        self.boil_amount = self.sculpt_layers[0]
+        self.boil_speed = remap01(self.sculpt_layers[0], 0.3, 2.5)
 
     def _apply_zone_deform(self, v):
         if not np.any(self.zone_strengths):
@@ -616,6 +657,77 @@ class SynthObject:
         ) * (1.0 / 3.0)
         v += self.base_norms * (noise[:, None] * (self.boil_amount * self.boil_scale))
 
+    def _apply_sculpt_layers(self, v, t):
+        layers = self.sculpt_layers
+        boil = layers[0]
+        if boil > 1e-4:
+            self.boil_amount = boil
+            self.boil_speed = remap01(boil, 0.3, 2.5)
+            self._apply_boil(v, t)
+
+        crackle = layers[1]
+        if crackle > 1e-4:
+            phase = t * 12.0
+            noise = np.sign(np.sin(self.crackle_seeds + phase))
+            v += self.base_norms * (noise[:, None] * (crackle * 0.06))
+
+        twist = unit_to_bipolar(layers[2]) * 0.7
+        if abs(twist) > 1e-4:
+            x = v[:, 0].copy()
+            z = v[:, 2].copy()
+            angle = twist * v[:, 1]
+            c = np.cos(angle)
+            s = np.sin(angle)
+            v[:, 0] = x * c - z * s
+            v[:, 2] = x * s + z * c
+
+        shear = unit_to_bipolar(layers[3]) * 0.45
+        if abs(shear) > 1e-4:
+            v[:, 0] += shear * v[:, 1]
+
+        pulse = layers[4]
+        if pulse > 1e-4:
+            swell = math.sin(t * 1.6)
+            v += self.base_norms * (swell * pulse * 0.18)
+
+        curl = unit_to_bipolar(layers[5]) * 1.1
+        if abs(curl) > 1e-4:
+            x = v[:, 0].copy()
+            z = v[:, 2].copy()
+            radius = np.sqrt(x * x + z * z)
+            angle = curl * radius
+            c = np.cos(angle)
+            s = np.sin(angle)
+            v[:, 0] = x * c - z * s
+            v[:, 2] = x * s + z * c
+
+        drift = layers[6]
+        if drift > 1e-4:
+            phase = t * 0.6
+            drift_scale = np.sin(self.drift_seeds + phase)
+            v += self.drift_dirs * (drift_scale[:, None] * (drift * 0.12))
+
+        bias = unit_to_bipolar(layers[7]) * 0.28
+        if abs(bias) > 1e-4:
+            v += self.bias_dir * bias
+
+    def _apply_collision_deform(self, v, dt):
+        if self.collision_strength < 1e-4:
+            return
+        dots = self.zone_dirs @ self.collision_dir
+        zone = int(np.argmax(dots))
+        idx = self.zone_indices[zone]
+        if idx.size > 0:
+            v[idx] -= self.zone_dirs[zone] * (self.collision_strength * 0.8)
+        decay = max(0.0, 1.0 - dt * 4.0)
+        self.collision_strength *= decay
+
+    def trigger_collision(self, direction, strength):
+        if strength <= self.collision_strength:
+            return
+        self.collision_strength = strength
+        self.collision_dir = direction
+
     def update(self, t, dt):
         if not self.active:
             return
@@ -624,7 +736,8 @@ class SynthObject:
         v[:] = self.base_verts
 
         self._apply_zone_deform(v)
-        self._apply_boil(v, t)
+        self._apply_collision_deform(v, dt)
+        self._apply_sculpt_layers(v, t)
 
         if self.shape is not None:
             self.shape.buf[0].re_init(pts=v)
@@ -637,9 +750,18 @@ class SynthObject:
         lfo_rot = self.lfo_rot.tick(t, dt)
 
         scale = max(0.05, self.scale * (1.0 + lfo_scale))
-        pos_x = self.pos[0] + self.move_axis[0] * lfo_move
-        pos_y = self.pos[1] + self.move_axis[1] * lfo_move
-        pos_z = self.pos[2] + self.move_axis[2] * lfo_move
+        pos_x = self.pos[0]
+        pos_y = self.pos[1]
+        pos_z = self.pos[2]
+        if self.lfo_move.enabled:
+            if self.move_lfo_mode == "orbit":
+                phase = self.lfo_move.phase
+                pos_x += self.orbit_amp_x * math.sin(phase)
+                pos_y += self.orbit_amp_y * math.cos(phase)
+            elif self.move_lfo_mode == "x":
+                pos_x += lfo_move
+            elif self.move_lfo_mode == "y":
+                pos_y += lfo_move
 
         rot_x = self.rot[0] + self.rot_axis[0] * lfo_rot
         rot_y = self.rot[1] + self.rot_axis[1] * lfo_rot
@@ -807,6 +929,9 @@ def apply_controls(objects, midi_state, active_toggles, sculpt_mode, sculpt_targ
         else:
             obj.exit_sculpt_mode()
 
+        ch_a, ch_b = object_channel_indices(i)
+        m_a = midi_state.m_buttons[ch_a]
+        m_b = midi_state.m_buttons[ch_b]
         s_active, m_active, r_active = object_button_states(midi_state, i)
         if obj.needs_rearm_scale and not s_active:
             obj.needs_rearm_scale = False
@@ -818,6 +943,14 @@ def apply_controls(objects, midi_state, active_toggles, sculpt_mode, sculpt_targ
         obj.lfo_scale.enabled = s_active and not obj.needs_rearm_scale
         obj.lfo_move.enabled = m_active and not obj.needs_rearm_move
         obj.lfo_rot.enabled = r_active and not obj.needs_rearm_rot
+        if m_a and m_b:
+            obj.move_lfo_mode = "orbit"
+        elif m_a:
+            obj.move_lfo_mode = "x"
+        elif m_b:
+            obj.move_lfo_mode = "y"
+        else:
+            obj.move_lfo_mode = "none"
 
         mode = modes[i]
         if sculpt_mode:
@@ -834,6 +967,33 @@ def apply_controls(objects, midi_state, active_toggles, sculpt_mode, sculpt_targ
         elif mode == MODE_LFO_ROT and obj.lfo_rot.enabled:
             obj.set_lfo_params_from_controls(midi_state, i, "rot")
     return active_toggles, modes
+
+
+def apply_collisions(objects):
+    for i in range(len(objects)):
+        obj_a = objects[i]
+        if not obj_a.active:
+            continue
+        pos_a = obj_a.last_draw_pos
+        r_a = obj_a.bound_radius * obj_a.last_draw_scale
+        for j in range(i + 1, len(objects)):
+            obj_b = objects[j]
+            if not obj_b.active:
+                continue
+            pos_b = obj_b.last_draw_pos
+            delta = pos_a - pos_b
+            dist = float(np.linalg.norm(delta))
+            if dist < 1e-6:
+                continue
+            r_b = obj_b.bound_radius * obj_b.last_draw_scale
+            limit = r_a + r_b
+            if dist >= limit:
+                continue
+            overlap = limit - dist
+            strength = min(overlap * 0.45, 0.3)
+            direction = delta / dist
+            obj_a.trigger_collision(direction, strength)
+            obj_b.trigger_collision(-direction, strength)
 
 
 def lfo_state_summary(midi_state):
@@ -862,11 +1022,13 @@ def run_desktop_preview():
     window = pyglet.window.Window(1280, 720, caption="Puddy3D Preview", resizable=True)
     gl.glClearColor(0.02, 0.02, 0.02, 1.0)
     gl.glEnable(gl.GL_DEPTH_TEST)
+    gl.glEnable(gl.GL_BLEND)
+    gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
     gl.glPointSize(2.0)
 
     # Fog parameters for subtle retro depth shading
     FOG_NEAR = 2.0
-    FOG_FAR = 6.0
+    FOG_FAR = 8.0
     FOG_COLOR = (0.02, 0.02, 0.02)
 
     names = list_midi_inputs()
@@ -925,6 +1087,7 @@ def run_desktop_preview():
 
     render_solid = True
     render_wire = True
+    camera_z = 4.0
 
     start_time = time.time()
     last_time = start_time
@@ -998,6 +1161,7 @@ def run_desktop_preview():
             objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
         )
 
+        apply_collisions(objects)
         for obj in objects:
             obj.update(t, dt)
 
@@ -1022,11 +1186,13 @@ def run_desktop_preview():
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
         gl.glMatrixMode(gl.GL_MODELVIEW)
         gl.glLoadIdentity()
-        gl.glTranslatef(0.0, 0.0, -4.0)
+        gl.glTranslatef(0.0, 0.0, -camera_z)
 
-        # Helper for depth fog
-        def fog_factor(z):
-            return clamp((FOG_FAR - z) / (FOG_FAR - FOG_NEAR), 0.0, 1.0)
+        # Helper for depth fog using distance from camera
+        def fog_factor(z_world):
+            dist = camera_z - z_world
+            fog = (FOG_FAR - dist) / (FOG_FAR - FOG_NEAR)
+            return np.clip(fog, 0.0, 1.0)
 
         for i, obj in enumerate(objects):
             if not obj.active:
@@ -1044,7 +1210,7 @@ def run_desktop_preview():
                 count = len(tri_inds)
                 # Compute average z for this triangle batch
                 z_avg = np.mean(verts[tri_inds][:, 2])
-                f = fog_factor(abs(z_avg))
+                f = fog_factor(z_avg)
                 fogged_rgb = (
                     rgb[0] * f + FOG_COLOR[0] * (1.0 - f),
                     rgb[1] * f + FOG_COLOR[1] * (1.0 - f),
@@ -1057,34 +1223,29 @@ def run_desktop_preview():
                 gl.glDisable(gl.GL_POLYGON_OFFSET_FILL)
 
             if render_wire and line_inds is not None:
-                line_verts = verts[line_inds].astype(np.float32).ravel()
+                line_vertices = verts[line_inds].astype(np.float32)
                 count = len(line_inds)
-                # Compute average z for this line batch
-                z_avg = np.mean(verts[line_inds][:, 2])
-                f = fog_factor(abs(z_avg))
-                fogged_rgb = (
-                    rgb[0] * f + FOG_COLOR[0] * (1.0 - f),
-                    rgb[1] * f + FOG_COLOR[1] * (1.0 - f),
-                    rgb[2] * f + FOG_COLOR[2] * (1.0 - f),
-                )
-                color_list = fogged_rgb * count
+                fog = fog_factor(line_vertices[:, 2])
+                color_list = np.empty((count, 4), dtype=np.float32)
+                color_list[:, 0] = rgb[0] * fog + FOG_COLOR[0] * (1.0 - fog)
+                color_list[:, 1] = rgb[1] * fog + FOG_COLOR[1] * (1.0 - fog)
+                color_list[:, 2] = rgb[2] * fog + FOG_COLOR[2] * (1.0 - fog)
+                color_list[:, 3] = fog
+                line_verts = line_vertices.ravel()
                 pyglet.graphics.draw(
-                    count, gl.GL_LINES, ("v3f", line_verts), ("c3f", color_list)
+                    count, gl.GL_LINES, ("v3f", line_verts), ("c4f", color_list.ravel())
                 )
             elif render_wire and line_inds is None:
                 point_verts = verts.astype(np.float32).ravel()
                 count = len(verts)
-                # Compute average z for points
-                z_avg = np.mean(verts[:, 2])
-                f = fog_factor(abs(z_avg))
-                fogged_rgb = (
-                    rgb[0] * f + FOG_COLOR[0] * (1.0 - f),
-                    rgb[1] * f + FOG_COLOR[1] * (1.0 - f),
-                    rgb[2] * f + FOG_COLOR[2] * (1.0 - f),
-                )
-                color_list = fogged_rgb * count
+                fog = fog_factor(verts[:, 2])
+                color_list = np.empty((count, 4), dtype=np.float32)
+                color_list[:, 0] = rgb[0] * fog + FOG_COLOR[0] * (1.0 - fog)
+                color_list[:, 1] = rgb[1] * fog + FOG_COLOR[1] * (1.0 - fog)
+                color_list[:, 2] = rgb[2] * fog + FOG_COLOR[2] * (1.0 - fog)
+                color_list[:, 3] = fog
                 pyglet.graphics.draw(
-                    count, gl.GL_POINTS, ("v3f", point_verts), ("c3f", color_list)
+                    count, gl.GL_POINTS, ("v3f", point_verts), ("c4f", color_list.ravel())
                 )
 
         label.draw()
@@ -1170,6 +1331,7 @@ def run_headless_mac():
                 objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
             )
 
+            apply_collisions(objects)
             for obj in objects:
                 obj.update(t, dt)
 
@@ -1297,8 +1459,8 @@ def run_pi3d():
         if line_inds is None or len(line_inds) == 0:
             return None, None
         pts = v[line_inds]
-        w = pi3d.Lines(vertices=pts, material=color, line_width=1, strip=False, camera=camera)
-        w.set_draw_details(wire_shader, [], 1.0, 1.0, 1.0, 1.0)
+        w = pi3d.Lines(vertices=pts, material=color, line_width=1.7, strip=False, camera=camera)
+        w.set_draw_details(wire_shader, [], 1.7, 1.4, 1.7, 1.3)
         w.set_material(color)
         return w, line_inds
 
@@ -1419,6 +1581,7 @@ def run_pi3d():
             objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
         )
 
+        apply_collisions(objects)
         camera.reset()
         camera.position((0.0, 0.0, 4.0))
         camera.look_at((0, 0, 0))
