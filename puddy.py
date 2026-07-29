@@ -22,6 +22,7 @@ HEADLESS_FPS_LIMIT = 60
 NUM_OBJECTS = 4
 TAU = 2.0 * math.pi
 DEADZONE = 0.05
+MIDI_SMOOTHING_HZ = 18.0
 
 BASE_X_RANGE = 1.44
 BASE_Y_RANGE = 1.44
@@ -77,7 +78,18 @@ def detect_backend():
     sysname = platform.system()
     if sysname == "Darwin":
         return "desktop" if pyglet is not None else "mac"
+    if sysname == "Linux":
+        return "pi" if is_raspberry_pi() else "desktop" if pyglet is not None else "pi"
     return "pi"
+
+
+def is_raspberry_pi():
+    model_path = "/proc/device-tree/model"
+    try:
+        with open(model_path, "r", encoding="utf-8") as fh:
+            return "raspberry pi" in fh.read().lower()
+    except OSError:
+        return False
 
 
 def remap01(v, lo, hi):
@@ -146,6 +158,8 @@ class MidiState:
         base_unit = 64.0 / 127.0
         self.knobs_f = np.full(8, base_unit, dtype=np.float32)
         self.faders_f = np.full(8, base_unit, dtype=np.float32)
+        self.knobs_target_f = self.knobs_f.copy()
+        self.faders_target_f = self.faders_f.copy()
         self.s_buttons = [False] * 8
         self.m_buttons = [False] * 8
         self.r_buttons = [False] * 8
@@ -182,12 +196,12 @@ class MidiState:
         if cc in MIDI_CC_TO_FADER:
             idx = MIDI_CC_TO_FADER[cc]
             self.faders[idx] = val
-            self.faders_f[idx] = val * (1.0 / 127.0)
+            self.faders_target_f[idx] = val * (1.0 / 127.0)
             return
         if cc in MIDI_CC_TO_KNOB:
             idx = MIDI_CC_TO_KNOB[cc]
             self.knobs[idx] = val
-            self.knobs_f[idx] = val * (1.0 / 127.0)
+            self.knobs_target_f[idx] = val * (1.0 / 127.0)
             return
         new_state = val > 0
         if cc in MIDI_CC_TO_S:
@@ -210,6 +224,13 @@ class MidiState:
             self.track_right = new_state
         elif cc == CC_REC:
             self.rec_transport = new_state
+
+    def tick(self, dt):
+        if dt <= 0.0:
+            return
+        alpha = 1.0 - math.exp(-MIDI_SMOOTHING_HZ * dt)
+        self.knobs_f += (self.knobs_target_f - self.knobs_f) * alpha
+        self.faders_f += (self.faders_target_f - self.faders_f) * alpha
 
 
 # ---------- MIDI input
@@ -605,7 +626,7 @@ class SynthObject:
                 self.orbit_amp_x = amp_x
                 self.orbit_amp_y = amp_y
                 self.lfo_move.freq_hz = freq
-                self.lfo_move.amp = max(amp_x, amp_y, 1e-6)
+                self.lfo_move.amp = max(self.orbit_amp_x, self.orbit_amp_y, 1e-6)
             elif self.move_lfo_mode == "x":
                 freq = remap01(k_a, 0.05, 2.2)
                 amp = remap01(f_a, 0.0, 0.8)
@@ -630,7 +651,8 @@ class SynthObject:
     def set_sculpt_params_from_controls(self, midi_state, obj_idx):
         for i in range(8):
             self.zone_strengths[i] = norm_bipolar(midi_state.faders_f[i])
-        self.sculpt_layers[:] = midi_state.knobs_f[:8]
+        for i in range(8):
+            self.sculpt_layers[i] = midi_state.knobs_f[i]
         self.boil_amount = self.sculpt_layers[0]
         self.boil_speed = remap01(self.sculpt_layers[0], 0.3, 2.5)
 
@@ -969,33 +991,6 @@ def apply_controls(objects, midi_state, active_toggles, sculpt_mode, sculpt_targ
     return active_toggles, modes
 
 
-def apply_collisions(objects):
-    for i in range(len(objects)):
-        obj_a = objects[i]
-        if not obj_a.active:
-            continue
-        pos_a = obj_a.last_draw_pos
-        r_a = obj_a.bound_radius * obj_a.last_draw_scale
-        for j in range(i + 1, len(objects)):
-            obj_b = objects[j]
-            if not obj_b.active:
-                continue
-            pos_b = obj_b.last_draw_pos
-            delta = pos_a - pos_b
-            dist = float(np.linalg.norm(delta))
-            if dist < 1e-6:
-                continue
-            r_b = obj_b.bound_radius * obj_b.last_draw_scale
-            limit = r_a + r_b
-            if dist >= limit:
-                continue
-            overlap = limit - dist
-            strength = min(overlap * 0.45, 0.3)
-            direction = delta / dist
-            obj_a.trigger_collision(direction, strength)
-            obj_b.trigger_collision(-direction, strength)
-
-
 def lfo_state_summary(midi_state):
     parts = []
     for i in range(NUM_OBJECTS):
@@ -1026,10 +1021,12 @@ def run_desktop_preview():
     gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
     gl.glPointSize(2.0)
 
-    # Fog parameters for subtle retro depth shading
-    FOG_NEAR = 2.0
-    FOG_FAR = 8.0
-    FOG_COLOR = (0.02, 0.02, 0.02)
+    # Fog parameters for subtle retro depth shading without crushing contrast.
+    FOG_NEAR = 1.8
+    FOG_FAR = 5.8
+    FOG_COLOR = (0.10, 0.10, 0.12)
+    FOG_MIN_BRIGHTNESS = 0.52
+    WIRE_MIN_ALPHA = 0.38
 
     names = list_midi_inputs()
     port = open_nanoport(names=names, quiet_no_input=True)
@@ -1088,14 +1085,22 @@ def run_desktop_preview():
     render_solid = True
     render_wire = True
     camera_z = 4.0
+    overlap_pair_colors = {
+        (0, 1): (1.0, 0.25, 0.25, 0.9),
+        (0, 2): (1.0, 0.7, 0.2, 0.9),
+        (0, 3): (1.0, 0.2, 0.8, 0.9),
+        (1, 2): (0.2, 1.0, 0.25, 0.9),
+        (1, 3): (0.2, 1.0, 1.0, 0.9),
+        (2, 3): (0.45, 0.35, 1.0, 0.9),
+    }
 
     start_time = time.time()
     last_time = start_time
     fps_smooth = 0.0
-    active_state = [False] * NUM_OBJECTS
+    active_state = [True] * NUM_OBJECTS
     sculpt_mode = False
     sculpt_target_index = None
-    active_toggles = [False] * NUM_OBJECTS
+    active_toggles = [True] * NUM_OBJECTS
     sculpt_rearm = False
 
 
@@ -1146,12 +1151,14 @@ def run_desktop_preview():
                 if PRINT_MIDI:
                     print(msg)
                 midi_state.update_from_msg(msg)
+        midi_state.tick(dt)
 
         if button_rising(midi_state.rec_transport, midi_state.rec_transport_prev):
             apply_reset(objects, midi_state)
             sculpt_mode = False
             sculpt_target_index = None
             sculpt_rearm = False
+            active_toggles = [True] * NUM_OBJECTS
 
         active_toggles = update_active_toggles(midi_state, active_toggles)
         sculpt_mode, sculpt_target_index, sculpt_rearm = update_sculpt_state(
@@ -1161,7 +1168,6 @@ def run_desktop_preview():
             objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
         )
 
-        apply_collisions(objects)
         for obj in objects:
             obj.update(t, dt)
 
@@ -1194,12 +1200,22 @@ def run_desktop_preview():
             fog = (FOG_FAR - dist) / (FOG_FAR - FOG_NEAR)
             return np.clip(fog, 0.0, 1.0)
 
+        def fogged_rgb(rgb, fog):
+            brightness = FOG_MIN_BRIGHTNESS + (1.0 - FOG_MIN_BRIGHTNESS) * fog
+            return (
+                rgb[0] * brightness + FOG_COLOR[0] * (1.0 - brightness),
+                rgb[1] * brightness + FOG_COLOR[1] * (1.0 - brightness),
+                rgb[2] * brightness + FOG_COLOR[2] * (1.0 - brightness),
+            )
+
+        transformed_verts = [None] * NUM_OBJECTS
         for i, obj in enumerate(objects):
             if not obj.active:
                 continue
             verts = _transform_vertices(
                 obj.working_verts, obj.last_draw_pos, obj.last_draw_rot, obj.last_draw_scale
             )
+            transformed_verts[i] = verts
             tri_inds = mesh_tris[i]
             line_inds = mesh_lines[i]
             rgb = mesh_colors[i][:3]
@@ -1208,15 +1224,9 @@ def run_desktop_preview():
                 gl.glPolygonOffset(1.0, 1.0)
                 tri_verts = verts[tri_inds].astype(np.float32).ravel()
                 count = len(tri_inds)
-                # Compute average z for this triangle batch
                 z_avg = np.mean(verts[tri_inds][:, 2])
                 f = fog_factor(z_avg)
-                fogged_rgb = (
-                    rgb[0] * f + FOG_COLOR[0] * (1.0 - f),
-                    rgb[1] * f + FOG_COLOR[1] * (1.0 - f),
-                    rgb[2] * f + FOG_COLOR[2] * (1.0 - f),
-                )
-                color_list = fogged_rgb * count
+                color_list = fogged_rgb(rgb, f) * count
                 pyglet.graphics.draw(
                     count, gl.GL_TRIANGLES, ("v3f", tri_verts), ("c3f", color_list)
                 )
@@ -1226,11 +1236,12 @@ def run_desktop_preview():
                 line_vertices = verts[line_inds].astype(np.float32)
                 count = len(line_inds)
                 fog = fog_factor(line_vertices[:, 2])
+                brightness = FOG_MIN_BRIGHTNESS + (1.0 - FOG_MIN_BRIGHTNESS) * fog
                 color_list = np.empty((count, 4), dtype=np.float32)
-                color_list[:, 0] = rgb[0] * fog + FOG_COLOR[0] * (1.0 - fog)
-                color_list[:, 1] = rgb[1] * fog + FOG_COLOR[1] * (1.0 - fog)
-                color_list[:, 2] = rgb[2] * fog + FOG_COLOR[2] * (1.0 - fog)
-                color_list[:, 3] = fog
+                color_list[:, 0] = rgb[0] * brightness + FOG_COLOR[0] * (1.0 - brightness)
+                color_list[:, 1] = rgb[1] * brightness + FOG_COLOR[1] * (1.0 - brightness)
+                color_list[:, 2] = rgb[2] * brightness + FOG_COLOR[2] * (1.0 - brightness)
+                color_list[:, 3] = WIRE_MIN_ALPHA + (1.0 - WIRE_MIN_ALPHA) * fog
                 line_verts = line_vertices.ravel()
                 pyglet.graphics.draw(
                     count, gl.GL_LINES, ("v3f", line_verts), ("c4f", color_list.ravel())
@@ -1239,14 +1250,56 @@ def run_desktop_preview():
                 point_verts = verts.astype(np.float32).ravel()
                 count = len(verts)
                 fog = fog_factor(verts[:, 2])
+                brightness = FOG_MIN_BRIGHTNESS + (1.0 - FOG_MIN_BRIGHTNESS) * fog
                 color_list = np.empty((count, 4), dtype=np.float32)
-                color_list[:, 0] = rgb[0] * fog + FOG_COLOR[0] * (1.0 - fog)
-                color_list[:, 1] = rgb[1] * fog + FOG_COLOR[1] * (1.0 - fog)
-                color_list[:, 2] = rgb[2] * fog + FOG_COLOR[2] * (1.0 - fog)
-                color_list[:, 3] = fog
+                color_list[:, 0] = rgb[0] * brightness + FOG_COLOR[0] * (1.0 - brightness)
+                color_list[:, 1] = rgb[1] * brightness + FOG_COLOR[1] * (1.0 - brightness)
+                color_list[:, 2] = rgb[2] * brightness + FOG_COLOR[2] * (1.0 - brightness)
+                color_list[:, 3] = WIRE_MIN_ALPHA + (1.0 - WIRE_MIN_ALPHA) * fog
                 pyglet.graphics.draw(
                     count, gl.GL_POINTS, ("v3f", point_verts), ("c4f", color_list.ravel())
                 )
+
+        # Pair-overlap markers using unique third colors per pair.
+        gl.glPointSize(7.0)
+        for i in range(NUM_OBJECTS):
+            if not objects[i].active:
+                continue
+            for j in range(i + 1, NUM_OBJECTS):
+                if not objects[j].active:
+                    continue
+                pos_i = objects[i].last_draw_pos
+                pos_j = objects[j].last_draw_pos
+                delta = pos_j - pos_i
+                dist = float(np.linalg.norm(delta))
+                if dist < 1e-6:
+                    continue
+                r_i = objects[i].bound_radius * objects[i].last_draw_scale
+                r_j = objects[j].bound_radius * objects[j].last_draw_scale
+                overlap = (r_i + r_j) - dist
+                if overlap <= 0.0:
+                    continue
+                t = (r_i - 0.5 * overlap) / (dist + 1e-6)
+                center = pos_i + delta * np.clip(t, 0.0, 1.0)
+                c = overlap_pair_colors.get((i, j), (1.0, 1.0, 1.0, 0.9))
+                marker = np.array(
+                    [
+                        center + np.array([0.0, 0.0, 0.0], dtype=np.float32),
+                        center + np.array([0.04, 0.0, 0.0], dtype=np.float32),
+                        center + np.array([-0.04, 0.0, 0.0], dtype=np.float32),
+                        center + np.array([0.0, 0.04, 0.0], dtype=np.float32),
+                        center + np.array([0.0, -0.04, 0.0], dtype=np.float32),
+                    ],
+                    dtype=np.float32,
+                )
+                marker_colors = np.array([c] * len(marker), dtype=np.float32)
+                pyglet.graphics.draw(
+                    len(marker),
+                    gl.GL_POINTS,
+                    ("v3f", marker.ravel()),
+                    ("c4f", marker_colors.ravel()),
+                )
+        gl.glPointSize(2.0)
 
         label.draw()
 
@@ -1291,7 +1344,7 @@ def run_headless_mac():
 
     sculpt_mode = False
     sculpt_target_index = None
-    active_toggles = [False] * NUM_OBJECTS
+    active_toggles = [True] * NUM_OBJECTS
     sculpt_rearm = False
 
     start_time = time.time()
@@ -1316,12 +1369,14 @@ def run_headless_mac():
                         print(msg)
                     midi_state.update_from_msg(msg)
                     midi_msgs_since_status += 1
+            midi_state.tick(dt)
 
             if button_rising(midi_state.rec_transport, midi_state.rec_transport_prev):
                 apply_reset(objects, midi_state)
                 sculpt_mode = False
                 sculpt_target_index = None
                 sculpt_rearm = False
+                active_toggles = [True] * NUM_OBJECTS
 
             active_toggles = update_active_toggles(midi_state, active_toggles)
             sculpt_mode, sculpt_target_index, sculpt_rearm = update_sculpt_state(
@@ -1331,7 +1386,6 @@ def run_headless_mac():
                 objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
             )
 
-            apply_collisions(objects)
             for obj in objects:
                 obj.update(t, dt)
 
@@ -1485,15 +1539,16 @@ def run_pi3d():
     display = pi3d.Display.create(x=0, y=0, w=1280, h=720, frames_per_second=60)
     display.set_background(0.02, 0.02, 0.02, 1.0)
     # Enable subtle depth fog to match desktop preview
-    display.set_fog((0.02, 0.02, 0.02, 1.0), 2.0, 6.0)
+    if hasattr(display, "set_fog"):
+        display.set_fog((0.02, 0.02, 0.02, 1.0), 2.0, 6.0)
     camera = pi3d.Camera(is_3d=True)
     light = pi3d.Light(
         lightpos=(3, 4, 6),
         lightcol=(0.9, 0.9, 0.9),
         lightamb=(0.2, 0.2, 0.2),
     )
-    shader = _load_shader("uv_flat")
-    wire_shader = _load_shader("uv_flat")
+    shader = _load_shader("mat_light", fallback="mat_flat")
+    wire_shader = _load_shader("mat_flat")
 
     colors = [
         (0.9, 0.6, 0.2, 1.0),
@@ -1540,7 +1595,7 @@ def run_pi3d():
     last_time = start_time
     sculpt_mode = False
     sculpt_target_index = None
-    active_toggles = [False] * NUM_OBJECTS
+    active_toggles = [True] * NUM_OBJECTS
     sculpt_rearm = False
 
     while display.loop_running():
@@ -1557,6 +1612,7 @@ def run_pi3d():
                 if PRINT_MIDI:
                     print(msg)
                 midi_state.update_from_msg(msg)
+        midi_state.tick(dt)
 
         k = kb.read()
         if k > -1:
@@ -1581,33 +1637,40 @@ def run_pi3d():
             objects, midi_state, active_toggles, sculpt_mode, sculpt_target_index
         )
 
-        apply_collisions(objects)
         camera.reset()
         camera.position((0.0, 0.0, 4.0))
-        camera.look_at((0, 0, 0))
+        camera.point_at((0, 0, 0))
 
         for obj in objects:
             obj.update(t, dt)
             obj.draw()
 
         if point_text and debug_block and (t - last_debug) > 0.25:
-            inst_fps = 1.0 / dt if dt > 0.0 else 0.0
-            fps = fps * 0.9 + inst_fps * 0.1
-            sculpt_label = "off"
-            if sculpt_mode and sculpt_target_index is not None:
-                sculpt_label = "on:{}".format(sculpt_target_index + 1)
-            elif sculpt_mode:
-                sculpt_label = "on"
-            active_list = [str(i + 1) for i, a in enumerate(active) if a]
-            active_text = ",".join(active_list) if active_list else "none"
-            debug_block.set_text(
-                "fps: {:.1f}\nsculpt: {}\nactive: {}".format(fps, sculpt_label, active_text)
-            )
-            point_text.regen()
-            last_debug = t
+            try:
+                inst_fps = 1.0 / dt if dt > 0.0 else 0.0
+                fps = fps * 0.9 + inst_fps * 0.1
+                sculpt_label = "off"
+                if sculpt_mode and sculpt_target_index is not None:
+                    sculpt_label = "on:{}".format(sculpt_target_index + 1)
+                elif sculpt_mode:
+                    sculpt_label = "on"
+                active_list = [str(i + 1) for i, a in enumerate(active) if a]
+                active_text = ",".join(active_list) if active_list else "none"
+                debug_block.set_text(
+                    "fps: {:.1f}\nsculpt: {}\nactive: {}".format(fps, sculpt_label, active_text)
+                )
+                point_text.regen()
+                last_debug = t
+            except Exception:
+                point_text = None
+                debug_block = None
 
         if point_text:
-            point_text.draw()
+            try:
+                point_text.draw()
+            except Exception:
+                point_text = None
+                debug_block = None
 
     if port:
         port.close()
